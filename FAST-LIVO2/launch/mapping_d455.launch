@@ -1,0 +1,36 @@
+<launch>
+<!-- Launch file for RealSense D455 with Fast-LIVO2 -->
+
+<!-- <node pkg="tf" type="static_transform_publisher" name="camera_init_to_odom_to" 
+      args="0 0 0 -0.5 0.5 -0.5 0.5 camera_init odom  100" /> -->
+
+<node pkg="tf" type="static_transform_publisher" name="odom_to_camera_init" 
+      args="0 0 0 0.5 -0.5 0.5 -0.5 odom camera_init 100" />
+
+
+	<!-- Load Fast-LIVO2 main config for D455 -->
+	<rosparam command="load" file="$(find fast_livo)/config/d455.yaml" />
+
+	<!-- Fast-LIVO2 mapping node -->
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="log">
+		<rosparam file="$(find fast_livo)/config/camera_d455.yaml" />
+	</node>
+
+	<!-- Smart TF Bridge: Connects LIVO and RealSense TF trees intelligently -->
+	<!-- Desired: aft_mapped ≡ camera_color_optical_frame (identity) -->
+	<!-- Script will automatically find camera_link (root) and calculate proper transform -->
+	<node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
+		<param name="parent" value="aft_mapped" />
+		<param name="child" value="camera_imu_optical_frame" />
+		<!-- Identity transform (default values) -->
+		<param name="x" value="0.0" />
+		<param name="y" value="0.0" />
+		<param name="z" value="0.0" />
+		<param name="qx" value="0.0" />
+		<param name="qy" value="0.0" />
+		<param name="qz" value="0.0" />
+		<param name="qw" value="1.0" />
+	</node>
+
+
+</launch>

@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+devel/
+install/
+*.pyc
+*.pyo
+__pycache__/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+cmake-build-*/
+
+# ROS generated files
+*.autosave
+CATKIN_IGNORE
+
+# Temporary files
+frames.gv
+frames.pdf
+*.bag
+*.log
+
+# System files
+.DS_Store
+Thumbs.db

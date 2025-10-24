@@ -1,0 +1,16 @@
+cam_model: Pinhole
+cam_width: 640
+cam_height: 480
+scale: 1.0
+# D455 RGB camera intrinsics from /camera/color/camera_info
+# K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+cam_fx: 383.9691467285156
+cam_fy: 383.642822265625
+cam_cx: 326.26556396484375
+cam_cy: 240.77796936035156
+# Distortion coefficients (k1, k2, p1, p2) from D array
+# D: [k1, k2, p1, p2, k3]
+cam_d0: -0.05552756041288376
+cam_d1: 0.06889352202415466
+cam_d2: -0.00046880144509486854
+cam_d3: 0.00027945043984800577

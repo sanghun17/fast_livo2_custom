@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/hmcl/realsense_ros_ws/src/realsense-ros/realsense2_camera/launch/**)",
+      "Bash(rostopic list:*)",
+      "Bash(rosparam get:*)",
+      "Bash(rostopic info:*)",
+      "Bash(rosnode info:*)",
+      "Bash(rosrun tf tf_echo:*)",
+      "Bash(rosrun tf view_frames:*)",
+      "Bash(rosrun tf tf_tree:*)",
+      "Bash(rostopic echo:*)",
+      "Bash(rosparam list:*)",
+      "Read(//home/hmcl/realsense_ros_ws/src/realsense-ros/realsense2_camera/**)",
+      "Bash(rs-enumerate-devices:*)",
+      "Bash(cat:*)",
+      "Bash(rostopic hz:*)",
+      "Bash(rosnode list:*)",
+      "Bash(pkill:*)",
+      "Bash(kill:*)",
+      "Bash(./test_tf_bridge.sh:*)",
+      "Bash(rospack find:*)",
+      "Bash(rospack list:*)",
+      "Read(//home/hmcl/fast_livo2_ws/**)",
+      "Bash(killall:*)",
+      "Read(//home/hmcl/realsense_ros_ws/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
