@@ -187,10 +187,11 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
 {
   sub_pcl = p_pre->lidar_type == AVIA ? 
-            nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
-            nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
-  sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+            nh.subscribe(lid_topic, 1, &LIVMapper::livox_pcl_cbk, this): 
+            nh.subscribe(lid_topic, 1, &LIVMapper::standard_pcl_cbk, this);
+  sub_imu = nh.subscribe(imu_topic, 10, &LIVMapper::imu_cbk, this);
+  sub_img = nh.subscribe(img_topic, 1, &LIVMapper::img_cbk, this);
+  sub_gt_odom = nh.subscribe("/gt_odom", 1, &LIVMapper::gt_odom_cbk, this);  // Subscribe to GT odom
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -198,17 +199,23 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100);
   pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100);
   pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 10);
+  pubPoseAftMapped = nh.advertise<geometry_msgs::PoseStamped>("/aft_mapped_to_init_pose", 10);  // Added PoseStamped publisher
+  pubOdomAftMappedInOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init_odom", 10);  // Added Odometry in odom frame publisher
   pubPath = nh.advertise<nav_msgs::Path>("/path", 10);
   plane_pub = nh.advertise<visualization_msgs::Marker>("/planner_normal", 1);
   voxel_pub = nh.advertise<visualization_msgs::MarkerArray>("/voxels", 1);
   pubLaserCloudDyn = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj", 100);
   pubLaserCloudDynRmed = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_removed", 100);
   pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
-  mavros_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
   pubImage = it.advertise("/rgb_img", 1);
-  pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
+  pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
-  voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+  voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10);
+  
+  // Initialize dynamic reconfigure server
+  ROS_INFO("Initializing dynamic reconfigure server...");
+  dr_server.setCallback(boost::bind(&LIVMapper::reconfigure_callback, this, _1, _2));
+  ROS_INFO("Dynamic reconfigure server initialized successfully!");
 }
 
 void LIVMapper::handleFirstFrame() 
@@ -441,7 +448,6 @@ void LIVMapper::handleLIO()
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
-  publish_mavros(mavros_pose_publisher);
 
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
@@ -865,6 +871,73 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   sig_buffer.notify_all();
 }
 
+void LIVMapper::gt_odom_cbk(const nav_msgs::Odometry::ConstPtr &msg_in)
+{
+  if (gt_odom_received) return;  // Only process first GT odom message
+
+  ROS_INFO("Received GT odom for static TF initialization");
+  
+  // Create static transform from odom to camera_init
+  geometry_msgs::TransformStamped static_transform;
+  static_transform.header.stamp = ros::Time::now();
+  static_transform.header.frame_id = "odom";
+  static_transform.child_frame_id = "camera_init";
+  
+  // Copy pose data from GT odom
+  static_transform.transform.translation.x = msg_in->pose.pose.position.x;
+  static_transform.transform.translation.y = msg_in->pose.pose.position.y;
+  static_transform.transform.translation.z = msg_in->pose.pose.position.z;
+  static_transform.transform.rotation = msg_in->pose.pose.orientation;
+  
+  // Store transform for later use
+  odom_to_camera_init = static_transform.transform;
+  
+  // Publish static transform
+  static_tf_br.sendTransform(static_transform);
+  
+  ROS_INFO("Published static TF: odom -> camera_init [%.3f, %.3f, %.3f]", 
+           static_transform.transform.translation.x,
+           static_transform.transform.translation.y, 
+           static_transform.transform.translation.z);
+  
+  gt_odom_received = true;  // Mark as received
+}
+
+void LIVMapper::reconfigure_callback(fast_livo::LIVMapperConfigConfig &config, uint32_t level)
+{
+  ROS_INFO("Dynamic reconfigure callback called! reinitialize_with_gt_odom = %s", config.reinitialize_with_gt_odom ? "true" : "false");
+  
+  if (config.reinitialize_with_gt_odom) {
+    ROS_INFO("Reinitializing LIVO state with GT odom via dynamic reconfigure");
+    
+    // Reset GT odom flag to allow re-initialization
+    gt_odom_received = false;
+    
+    // Reset IMU processing
+    p_imu->Reset();
+    ROS_INFO("IMU processing reset");
+    
+    // Reset main state estimation 
+    _state.resetpose();
+    ROS_INFO("Main state estimation reset");
+    
+    // Reset VIO components
+    vio_manager->resetGrid();
+    vio_manager->visual_submap->reset();
+    ROS_INFO("VIO components reset");
+    
+    // Reset other flags
+    lidar_map_inited = false;
+    ekf_finish_once = false;
+    is_first_frame = true;
+    
+    ROS_INFO("LIVO reinitialization complete. Waiting for new GT odom message...");
+    
+    // Reset the parameter back to false to avoid repeated triggering
+    config.reinitialize_with_gt_odom = false;
+  }
+}
+
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
   if (lid_raw_data_buffer.empty() && lidar_en) return false;
@@ -1276,6 +1349,87 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
   odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
   set_posestamp(odomAftMapped.pose.pose);
 
+  // Set linear velocity in camera_init (world) frame
+  odomAftMapped.twist.twist.linear.x = _state.vel_end(0);
+  odomAftMapped.twist.twist.linear.y = _state.vel_end(1);
+  odomAftMapped.twist.twist.linear.z = _state.vel_end(2);
+
+  // Set angular velocity (bias-corrected) in body frame
+  if (imu_en && !imu_buffer.empty()) {
+    V3D angvel_raw(newest_imu.angular_velocity.x, newest_imu.angular_velocity.y, newest_imu.angular_velocity.z);
+    V3D angvel_corrected = angvel_raw - _state.bias_g;
+    odomAftMapped.twist.twist.angular.x = angvel_corrected(0);
+    odomAftMapped.twist.twist.angular.y = angvel_corrected(1);
+    odomAftMapped.twist.twist.angular.z = angvel_corrected(2);
+  }
+
+  // Publish PoseStamped transformed to odom frame
+  poseAftMapped.header.frame_id = "odom";
+  poseAftMapped.header.stamp = odomAftMapped.header.stamp;  // Same timestamp
+  
+  if (gt_odom_received) {
+    // Transform pose from camera_init to odom frame
+    // Current LIVO pose is in camera_init frame, we need to transform it to odom frame
+    geometry_msgs::Pose camera_init_pose;
+    set_posestamp(camera_init_pose);  // Get pose in camera_init frame
+    
+    // Create TF transforms for proper coordinate transformation
+    tf::Transform odom_to_camera_init_tf;
+    odom_to_camera_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x, 
+                                                  odom_to_camera_init.translation.y, 
+                                                  odom_to_camera_init.translation.z));
+    odom_to_camera_init_tf.setRotation(tf::Quaternion(odom_to_camera_init.rotation.x, 
+                                                       odom_to_camera_init.rotation.y,
+                                                       odom_to_camera_init.rotation.z, 
+                                                       odom_to_camera_init.rotation.w));
+    
+    tf::Transform camera_init_pose_tf;
+    camera_init_pose_tf.setOrigin(tf::Vector3(camera_init_pose.position.x, 
+                                              camera_init_pose.position.y, 
+                                              camera_init_pose.position.z));
+    camera_init_pose_tf.setRotation(tf::Quaternion(camera_init_pose.orientation.x, 
+                                                    camera_init_pose.orientation.y,
+                                                    camera_init_pose.orientation.z, 
+                                                    camera_init_pose.orientation.w));
+    
+    // Transform: odom_pose = odom_to_camera_init * camera_init_pose
+    tf::Transform odom_pose_tf = odom_to_camera_init_tf * camera_init_pose_tf;
+    
+    // Extract transformed pose
+    tf::Vector3 pos = odom_pose_tf.getOrigin();
+    tf::Quaternion quat = odom_pose_tf.getRotation();
+    
+    poseAftMapped.pose.position.x = pos.x();
+    poseAftMapped.pose.position.y = pos.y();
+    poseAftMapped.pose.position.z = pos.z();
+    poseAftMapped.pose.orientation.x = quat.x();
+    poseAftMapped.pose.orientation.y = quat.y();
+    poseAftMapped.pose.orientation.z = quat.z();
+    poseAftMapped.pose.orientation.w = quat.w();
+  } else {
+    // If no GT odom received yet, publish in camera_init frame as fallback
+    poseAftMapped.header.frame_id = "camera_init";
+    set_posestamp(poseAftMapped.pose);
+  }
+  
+  pubPoseAftMapped.publish(poseAftMapped);
+
+  // Publish Odometry in odom frame
+  if (gt_odom_received) {
+    odomAftMappedInOdom.header.frame_id = "odom";
+    odomAftMappedInOdom.child_frame_id = "base_link";
+    odomAftMappedInOdom.header.stamp = odomAftMapped.header.stamp;  // Same timestamp
+
+    // Use the transformed pose from poseAftMapped (which is already in odom frame)
+    odomAftMappedInOdom.pose.pose = poseAftMapped.pose;
+
+    // Copy twist from original odometry (in camera_init frame)
+    // Note: twist is typically expressed in the child frame (base_link), so it doesn't need transformation
+    odomAftMappedInOdom.twist.twist = odomAftMapped.twist.twist;
+
+    pubOdomAftMappedInOdom.publish(odomAftMappedInOdom);
+  }
+
   static tf::TransformBroadcaster br;
   tf::Transform transform;
   tf::Quaternion q;
@@ -1289,19 +1443,12 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
   pubOdomAftMapped.publish(odomAftMapped);
 }
 
-void LIVMapper::publish_mavros(const ros::Publisher &mavros_pose_publisher)
-{
-  msg_body_pose.header.stamp = ros::Time::now();
-  msg_body_pose.header.frame_id = "camera_init";
-  set_posestamp(msg_body_pose.pose);
-  mavros_pose_publisher.publish(msg_body_pose);
-}
-
 void LIVMapper::publish_path(const ros::Publisher pubPath)
 {
-  set_posestamp(msg_body_pose.pose);
-  msg_body_pose.header.stamp = ros::Time::now();
-  msg_body_pose.header.frame_id = "camera_init";
-  path.poses.push_back(msg_body_pose);
+  geometry_msgs::PoseStamped pose_stamped;
+  set_posestamp(pose_stamped.pose);
+  pose_stamped.header.stamp = ros::Time::now();
+  pose_stamped.header.frame_id = "camera_init";
+  path.poses.push_back(pose_stamped);
   pubPath.publish(path);
 }

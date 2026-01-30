@@ -1,2 +1,4 @@
 Log/*
 build/*
+data/*.bag
+data/*.bag

@@ -1,0 +1,21 @@
+# Camera configuration derived from OpenVINS simulator_stereo_cursor config
+# Using left camera (cam0) parameters
+
+cam_model: Pinhole
+cam_width: 640
+cam_height: 480
+scale: 1.0  # Downsample like MARS-LVIG for performance
+
+# Intrinsic parameters from OpenVINS cam0
+# intrinsics: [fx, cx, fy, cy] -> [386.126953125, 320.0, 386.126953125, 240.0]
+cam_fx: 386.126953125
+cam_fy: 386.126953125  
+cam_cx: 320.0
+cam_cy: 240.0
+
+# Distortion coefficients from OpenVINS (radtan model)
+# distortion_coeffs: [k1, k2, p1, p2]
+cam_d0: 0.0  # k1
+cam_d1: 0.0  # k2
+cam_d2: 0.0  # p1
+cam_d3: 0.0  # p2

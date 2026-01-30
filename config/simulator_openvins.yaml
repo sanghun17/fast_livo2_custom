@@ -1,0 +1,90 @@
+common:
+  img_topic: "/camera/left/image_raw"
+  lid_topic: "/voxel_grid/output"
+  imu_topic: "/airsim_node/hmcl/imu/imu"
+  img_en: 1
+  lidar_en: 1
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  # IMU to depth camera extrinsic (derived from OpenVINS T_imu_cam)
+  # T_imu_cam = [0.0, 0.0, 1.0, 0.25; -1.0, 0.0, 0.0, 0.0; 0.0, -1.0, 0.0, 0.25; 0.0, 0.0, 0.0, 1.0]
+  extrinsic_T: [0.25, 0.0, 0.25]
+  extrinsic_R: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+  
+  # Camera to depth camera extrinsic (both aligned - identity transform)
+  Rcl: [1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0]
+  Pcl: [0.0, 0.0, 0.0]
+
+time_offset: 
+  imu_time_offset: -0.06861  # From OpenVINS config
+  img_time_offset: 0.0
+  exposure_time_init: 0.0
+
+preprocess:
+  point_filter_num: 18 #14        # Less aggressive filtering like demo
+  filter_size_surf: 0.25 #0.1    # Larger voxel filter for simulator data
+  lidar_type: 4            # Standard PointCloud2 format (depth camera)
+  scan_line: 1             # Depth camera generates unorganized point cloud
+  blind: 0.1               # Moderate blind zone
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 1000  # Same as MARS-LVIG
+  img_point_cov: 1000      # Higher = fewer features (like MARS-LVIG)
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  # Use MARS-LVIG IMU settings for better performance
+  # OpenVINS values were too small: acc_cov: 0.00009206, gyr_cov: 0.000000127
+  # Direct conversion from noise_density to covariance doesn't work well for LIVO2
+  acc_cov: 2.0             # From MARS-LVIG (reasonable for LIVO2)
+  gyr_cov: 0.1             # From MARS-LVIG (reasonable for LIVO2)
+  b_acc_cov: 0.0001        # From MARS-LVIG
+  b_gyr_cov: 0.0001        # From MARS-LVIG
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02           # MARS-LVIG LIO parameters
+  beam_err: 0.05
+  min_eigen_value: 0.005
+  voxel_size: 1.0          # Smaller voxels like demo (was 2.0)
+  max_layer: 2             # Limit octree depth
+  max_points_num: 80       # More points per voxel like demo
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:  
+  map_sliding_en: false
+  half_map_size: 100
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: false
+
+publish:
+  dense_map_en: true
+  pub_effect_point_en: false 
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "simulator_openvins"
+  pose_output_en: false
+
+pcd_save:
+  pcd_save_en: false
+  colmap_output_en: false
+  filter_size_pcd: 0.15
+  interval: -1

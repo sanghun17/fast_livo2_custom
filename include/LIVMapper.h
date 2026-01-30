@@ -20,6 +20,9 @@ which is included as part of this source code package.
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
 #include <vikit/camera_loader.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <dynamic_reconfigure/server.h>
+#include <fast_livo/LIVMapperConfigConfig.h>
 
 class LIVMapper
 {
@@ -49,12 +52,13 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void gt_odom_cbk(const nav_msgs::Odometry::ConstPtr &msg_in);  // Added GT odom callback
+  void reconfigure_callback(fast_livo::LIVMapperConfigConfig &config, uint32_t level);  // Dynamic reconfigure callback
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
-  void publish_mavros(const ros::Publisher &mavros_pose_publisher);
   void publish_path(const ros::Publisher pubPath);
   void readParameters(ros::NodeHandle &nh);
   template <typename T> void set_posestamp(T &out);
@@ -91,6 +95,8 @@ public:
   StatesGroup imu_propagate, latest_ekf_state;
 
   bool new_imu = false, state_update_flg = false, imu_prop_enable = true, ekf_finish_once = false;
+  bool gt_odom_received = false;  // Track if GT odom was received
+  geometry_msgs::Transform odom_to_camera_init;  // Store transform from odom to camera_init
   deque<sensor_msgs::Imu> prop_imu_buffer;
   sensor_msgs::Imu newest_imu;
   double latest_ekf_time;
@@ -151,8 +157,9 @@ public:
 
   nav_msgs::Path path;
   nav_msgs::Odometry odomAftMapped;
+  geometry_msgs::PoseStamped poseAftMapped;  // Added PoseStamped message
+  nav_msgs::Odometry odomAftMappedInOdom;  // Odometry in odom frame
   geometry_msgs::Quaternion geoQuat;
-  geometry_msgs::PoseStamped msg_body_pose;
 
   PreprocessPtr p_pre;
   ImuProcessPtr p_imu;
@@ -170,12 +177,16 @@ public:
   ros::Publisher pubLaserCloudEffect;
   ros::Publisher pubLaserCloudMap;
   ros::Publisher pubOdomAftMapped;
+  ros::Publisher pubPoseAftMapped;  // Added PoseStamped publisher
+  ros::Publisher pubOdomAftMappedInOdom;  // Added Odometry in odom frame publisher
   ros::Publisher pubPath;
   ros::Publisher pubLaserCloudDyn;
+  ros::Subscriber sub_gt_odom;  // GT odom subscriber
+  tf2_ros::StaticTransformBroadcaster static_tf_br;  // Static TF broadcaster
+  dynamic_reconfigure::Server<fast_livo::LIVMapperConfigConfig> dr_server;  // Dynamic reconfigure server
   ros::Publisher pubLaserCloudDynRmed;
   ros::Publisher pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
-  ros::Publisher mavros_pose_publisher;
   ros::Timer imu_prop_timer;
 
   int frame_num = 0;

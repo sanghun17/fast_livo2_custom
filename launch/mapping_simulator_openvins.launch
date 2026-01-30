@@ -1,0 +1,20 @@
+<launch>
+<!-- Launch file for OpenVINS Simulator compatibility -->
+
+	<arg name="rviz" default="true" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/simulator_openvins.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="log">
+		<rosparam file="$(find fast_livo)/config/camera_simulator_openvins.yaml" />
+	</node>
+	
+	<!-- Static transform publisher: aft_mapped -> imu -->
+	<node pkg="tf2_ros" type="static_transform_publisher" name="aft_mapped_to_imu" 
+		  args="0 0 0 0 0 0 1 aft_mapped imu" />
+	
+	<!-- <group if="$(arg rviz)"> -->
+		<!-- <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" /> -->
+	<!-- </group>ㅊ -->
+
+</launch>
