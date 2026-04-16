@@ -69,7 +69,7 @@ local_map:
   sliding_thresh: 8
 
 uav:
-  imu_rate_odom: false
+  imu_rate_odom: true
   gravity_align_en: false
 
 publish:

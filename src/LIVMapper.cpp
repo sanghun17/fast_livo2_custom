@@ -615,15 +615,50 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
     posi = imu_propagate.pos_end;
     vel_i = imu_propagate.vel_end;
     q = Eigen::Quaterniond(imu_propagate.rot_end);
-    imu_prop_odom.header.frame_id = "world";
     imu_prop_odom.header.stamp = newest_imu.header.stamp;
-    imu_prop_odom.pose.pose.position.x = posi.x();
-    imu_prop_odom.pose.pose.position.y = posi.y();
-    imu_prop_odom.pose.pose.position.z = posi.z();
-    imu_prop_odom.pose.pose.orientation.w = q.w();
-    imu_prop_odom.pose.pose.orientation.x = q.x();
-    imu_prop_odom.pose.pose.orientation.y = q.y();
-    imu_prop_odom.pose.pose.orientation.z = q.z();
+
+    if (gt_odom_received) {
+      // Transform camera_init-frame pose into odom frame, same pattern as
+      // publish_odometry (/aft_mapped_to_init_odom). This makes the high-rate
+      // IMU-propagated odom directly usable as a control feedback in odom frame
+      // without an extra external transform node.
+      tf::Transform odom_to_cam_init_tf;
+      odom_to_cam_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
+                                                 odom_to_camera_init.translation.y,
+                                                 odom_to_camera_init.translation.z));
+      odom_to_cam_init_tf.setRotation(tf::Quaternion(odom_to_camera_init.rotation.x,
+                                                      odom_to_camera_init.rotation.y,
+                                                      odom_to_camera_init.rotation.z,
+                                                      odom_to_camera_init.rotation.w));
+      tf::Transform cam_init_pose_tf;
+      cam_init_pose_tf.setOrigin(tf::Vector3(posi.x(), posi.y(), posi.z()));
+      cam_init_pose_tf.setRotation(tf::Quaternion(q.x(), q.y(), q.z(), q.w()));
+      tf::Transform odom_pose_tf = odom_to_cam_init_tf * cam_init_pose_tf;
+      tf::Vector3 p = odom_pose_tf.getOrigin();
+      tf::Quaternion qt = odom_pose_tf.getRotation();
+      imu_prop_odom.header.frame_id = "odom";
+      imu_prop_odom.child_frame_id = "base_link";
+      imu_prop_odom.pose.pose.position.x = p.x();
+      imu_prop_odom.pose.pose.position.y = p.y();
+      imu_prop_odom.pose.pose.position.z = p.z();
+      imu_prop_odom.pose.pose.orientation.x = qt.x();
+      imu_prop_odom.pose.pose.orientation.y = qt.y();
+      imu_prop_odom.pose.pose.orientation.z = qt.z();
+      imu_prop_odom.pose.pose.orientation.w = qt.w();
+    } else {
+      // Fallback before GT odom arrives: publish raw internal frame (pre-existing behavior).
+      imu_prop_odom.header.frame_id = "world";
+      imu_prop_odom.child_frame_id = "";
+      imu_prop_odom.pose.pose.position.x = posi.x();
+      imu_prop_odom.pose.pose.position.y = posi.y();
+      imu_prop_odom.pose.pose.position.z = posi.z();
+      imu_prop_odom.pose.pose.orientation.w = q.w();
+      imu_prop_odom.pose.pose.orientation.x = q.x();
+      imu_prop_odom.pose.pose.orientation.y = q.y();
+      imu_prop_odom.pose.pose.orientation.z = q.z();
+    }
+    // Twist: matches publish_odometry pattern (no transformation; treated as
+    // expressed in child frame per ROS convention).
     imu_prop_odom.twist.twist.linear.x = vel_i.x();
     imu_prop_odom.twist.twist.linear.y = vel_i.y();
     imu_prop_odom.twist.twist.linear.z = vel_i.z();
@@ -1342,7 +1377,7 @@ void LIVMapper::publish_visual_features()
   sensor_msgs::PointCloud2 msg;
   pcl::toROSMsg(cur_frame_body, msg);
   msg.header.stamp = ros::Time::now();
-  msg.header.frame_id = "body";  // Body frame — receiver uses GT odom for world transform
+  msg.header.frame_id = "aft_mapped";  // FAST-LIVO VIO body (TF broadcast at publish_odometry)
   pubVisualFeatures.publish(msg);
 }
 
