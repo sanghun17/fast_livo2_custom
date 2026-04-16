@@ -172,7 +172,7 @@ public:
   V3F getInterpolatedPixel(cv::Mat img, V2D pc);
   
   // void resetRvizDisplay();
-  // deque<VisualPoint *> map_cur_frame;
+  deque<VisualPoint *> map_cur_frame;
   // deque<VisualPoint *> sub_map_ray;
   // deque<VisualPoint *> sub_map_ray_fov;
   // deque<VisualPoint *> visual_sub_map_cur;

@@ -2,16 +2,16 @@
 # Using left camera (cam0) parameters
 
 cam_model: Pinhole
-cam_width: 640
-cam_height: 480
-scale: 1.0  # Downsample like MARS-LVIG for performance
+cam_width: 320
+cam_height: 240
+scale: 1.0
 
-# Intrinsic parameters from OpenVINS cam0
-# intrinsics: [fx, cx, fy, cy] -> [386.126953125, 320.0, 386.126953125, 240.0]
-cam_fx: 386.126953125
-cam_fy: 386.126953125  
-cam_cx: 320.0
-cam_cy: 240.0
+# Intrinsic parameters for 320x240 (half of 640x480)
+# intrinsics: [fx, cx, fy, cy] -> [193.0634765625, 160.0, 193.0634765625, 120.0]
+cam_fx: 193.0634765625
+cam_fy: 193.0634765625
+cam_cx: 160.0
+cam_cy: 120.0
 
 # Distortion coefficients from OpenVINS (radtan model)
 # distortion_coeffs: [k1, k2, p1, p2]

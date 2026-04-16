@@ -19,7 +19,7 @@ extrin_calib:
   Pcl: [0.0, 0.0, 0.0]
 
 time_offset: 
-  imu_time_offset: -0.06861  # From OpenVINS config
+  imu_time_offset: 0.0  # AirSim: IMU and camera from same sim, no offset needed
   img_time_offset: 0.0
   exposure_time_init: 0.0
 

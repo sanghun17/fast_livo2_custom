@@ -196,6 +196,7 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
   pubSubVisualMap = nh.advertise<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 100);
+  pubVisualFeatures = nh.advertise<sensor_msgs::PointCloud2>("/fast_livo/visual_features", 10);
   pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100);
   pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100);
   pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 10);
@@ -280,33 +281,36 @@ void LIVMapper::stateEstimationAndMapping()
   }
 }
 
-void LIVMapper::handleVIO() 
+void LIVMapper::handleVIO()
 {
+  // ROS_WARN("[DBG-VIO] 1: enter handleVIO");
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << std::endl;
-    
-  if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) 
+
+  if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr))
   {
     std::cout << "[ VIO ] No point!!!" << std::endl;
     return;
   }
-    
-  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
 
-  if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1)) 
+  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
+  // ROS_WARN("[DBG-VIO] 2: before processFrame");
+
+  if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1))
   {
     vio_manager->plot_flag = true;
-  } 
-  else 
+  }
+  else
   {
     vio_manager->plot_flag = false;
   }
 
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  // ROS_WARN("[DBG-VIO] 3: after processFrame, feat_map=%zu", vio_manager->feat_map.size());
 
-  if (imu_prop_enable) 
+  if (imu_prop_enable)
   {
     ekf_finish_once = true;
     latest_ekf_state = _state;
@@ -314,20 +318,13 @@ void LIVMapper::handleVIO()
     state_update_flg = true;
   }
 
-  // int size_sub_map = vio_manager->visual_sub_map_cur.size();
-  // visual_sub_map->reserve(size_sub_map);
-  // for (int i = 0; i < size_sub_map; i++) 
-  // {
-  //   PointType temp_map;
-  //   temp_map.x = vio_manager->visual_sub_map_cur[i]->pos_[0];
-  //   temp_map.y = vio_manager->visual_sub_map_cur[i]->pos_[1];
-  //   temp_map.z = vio_manager->visual_sub_map_cur[i]->pos_[2];
-  //   temp_map.intensity = 0.;
-  //   visual_sub_map->push_back(temp_map);
-  // }
-
+  // ROS_WARN("[DBG-VIO] 4: before publish_frame_world");
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  // ROS_WARN("[DBG-VIO] 5: before publish_visual_features");
+  publish_visual_features();
+  // ROS_WARN("[DBG-VIO] 6: before publish_img_rgb");
   publish_img_rgb(pubImage, vio_manager);
+  // ROS_WARN("[DBG-VIO] 7: handleVIO done");
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -1312,6 +1309,41 @@ void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap)
     laserCloudmsg.header.frame_id = "camera_init";
     pubSubVisualMap.publish(laserCloudmsg);
   }
+}
+
+void LIVMapper::publish_visual_features()
+{
+  // Publish only CURRENT FRAME's newly triangulated features in body frame.
+  // This avoids VIO drift contamination — the receiver (sensor_bridge) transforms
+  // body → world using GT odom, then accumulates in world frame.
+  pcl::PointCloud<PointType> cur_frame_body;
+
+  // Current VIO body pose in camera_init frame
+  Eigen::Matrix3d R_ci_body = _state.rot_end;
+  Eigen::Vector3d t_ci_body = _state.pos_end;
+
+  for (auto* pt : vio_manager->map_cur_frame) {
+    if (pt == nullptr) continue;
+    // pt->pos_ is in camera_init frame; transform to body frame
+    Eigen::Vector3d pos_ci(pt->pos_[0], pt->pos_[1], pt->pos_[2]);
+    Eigen::Vector3d pos_body = R_ci_body.transpose() * (pos_ci - t_ci_body);
+
+    PointType p;
+    p.x = pos_body[0];
+    p.y = pos_body[1];
+    p.z = pos_body[2];
+    p.intensity = 0.0f;
+    cur_frame_body.push_back(p);
+  }
+  vio_manager->map_cur_frame.clear();
+
+  if (cur_frame_body.empty()) return;
+
+  sensor_msgs::PointCloud2 msg;
+  pcl::toROSMsg(cur_frame_body, msg);
+  msg.header.stamp = ros::Time::now();
+  msg.header.frame_id = "body";  // Body frame — receiver uses GT odom for world transform
+  pubVisualFeatures.publish(msg);
 }
 
 void LIVMapper::publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list)

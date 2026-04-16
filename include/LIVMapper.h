@@ -57,6 +57,7 @@ public:
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
+  void publish_visual_features();
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
   void publish_path(const ros::Publisher pubPath);
@@ -174,6 +175,8 @@ public:
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;
+  ros::Publisher pubVisualFeatures;
+  PointCloudXYZI accumulated_visual_features_;
   ros::Publisher pubLaserCloudEffect;
   ros::Publisher pubLaserCloudMap;
   ros::Publisher pubOdomAftMapped;

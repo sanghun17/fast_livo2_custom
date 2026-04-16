@@ -893,7 +893,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 
       insertPointIntoVoxelMap(pt_new);
       add += 1;
-      // map_cur_frame.push_back(pt_new);
+      map_cur_frame.push_back(pt_new);
     }
   }
 
