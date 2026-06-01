@@ -617,6 +617,8 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
     q = Eigen::Quaterniond(imu_propagate.rot_end);
     imu_prop_odom.header.stamp = newest_imu.header.stamp;
 
+    // Declared here so both pose and twist branches can use the rotation.
+    tf::Quaternion q_otc;
     if (gt_odom_received) {
       // Transform camera_init-frame pose into odom frame, same pattern as
       // publish_odometry (/aft_mapped_to_init_odom). This makes the high-rate
@@ -626,10 +628,11 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
       odom_to_cam_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
                                                  odom_to_camera_init.translation.y,
                                                  odom_to_camera_init.translation.z));
-      odom_to_cam_init_tf.setRotation(tf::Quaternion(odom_to_camera_init.rotation.x,
-                                                      odom_to_camera_init.rotation.y,
-                                                      odom_to_camera_init.rotation.z,
-                                                      odom_to_camera_init.rotation.w));
+      q_otc = tf::Quaternion(odom_to_camera_init.rotation.x,
+                             odom_to_camera_init.rotation.y,
+                             odom_to_camera_init.rotation.z,
+                             odom_to_camera_init.rotation.w);
+      odom_to_cam_init_tf.setRotation(q_otc);
       tf::Transform cam_init_pose_tf;
       cam_init_pose_tf.setOrigin(tf::Vector3(posi.x(), posi.y(), posi.z()));
       cam_init_pose_tf.setRotation(tf::Quaternion(q.x(), q.y(), q.z(), q.w()));
@@ -657,11 +660,34 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
       imu_prop_odom.pose.pose.orientation.y = q.y();
       imu_prop_odom.pose.pose.orientation.z = q.z();
     }
-    // Twist: matches publish_odometry pattern (no transformation; treated as
-    // expressed in child frame per ROS convention).
-    imu_prop_odom.twist.twist.linear.x = vel_i.x();
-    imu_prop_odom.twist.twist.linear.y = vel_i.y();
-    imu_prop_odom.twist.twist.linear.z = vel_i.z();
+    // Linear velocity: vel_i lives in camera_init WORLD frame. When pose is
+    // transformed to odom frame above, velocity must follow the same rotation
+    // or downstream loses frame consistency (ROS expects twist.linear in
+    // child_frame = odom-world direction here; downstream relays rotate
+    // odom→body). Angular velocity is already body frame (gyro-based).
+    if (gt_odom_received) {
+      tf::Vector3 vel_odom = tf::quatRotate(q_otc,
+                                tf::Vector3(vel_i.x(), vel_i.y(), vel_i.z()));
+      imu_prop_odom.twist.twist.linear.x = vel_odom.x();
+      imu_prop_odom.twist.twist.linear.y = vel_odom.y();
+      imu_prop_odom.twist.twist.linear.z = vel_odom.z();
+    } else {
+      imu_prop_odom.twist.twist.linear.x = vel_i.x();
+      imu_prop_odom.twist.twist.linear.y = vel_i.y();
+      imu_prop_odom.twist.twist.linear.z = vel_i.z();
+    }
+    // Angular velocity: latest IMU gyro minus estimated bias (body frame).
+    // Mirrors publish_odometry's convention so /LIVO2/imu_propagate is
+    // symmetric with the slower /aft_mapped_to_init_odom on this field.
+    {
+      V3D angvel_raw(newest_imu.angular_velocity.x,
+                     newest_imu.angular_velocity.y,
+                     newest_imu.angular_velocity.z);
+      V3D angvel_corrected = angvel_raw - imu_propagate.bias_g;
+      imu_prop_odom.twist.twist.angular.x = angvel_corrected(0);
+      imu_prop_odom.twist.twist.angular.y = angvel_corrected(1);
+      imu_prop_odom.twist.twist.angular.z = angvel_corrected(2);
+    }
     pubImuPropOdom.publish(imu_prop_odom);
   }
   mtx_buffer_imu_prop.unlock();
