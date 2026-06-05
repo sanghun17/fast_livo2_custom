@@ -1,0 +1,25 @@
+cam_model: Pinhole
+cam_width: 640
+cam_height: 480
+scale: 1.0
+# ---------------------------------------------------------------------------
+# Intel RealSense D435i  (serial 109622074087)
+# Captured 2026-06-01 from /camera/color/camera_info @ 640x480 on Jetson Orin AGX.
+# K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+#   The D435i color stream reports a rectified (plumb_bob) model with ZERO
+#   distortion → cam_d0..d3 are all 0.0. (D455 by contrast reports small Brown
+#   coeffs.) D435i color FOV is narrower than D455 → higher focal length.
+# NOTE: these intrinsics are for the 640x480 color stream that the onboard
+#   Realtek USB hub can sustain. If the camera is moved to a DIRECT root USB3
+#   port (see jetson-port-spec.md §camera) and run at 1280x720, RE-CAPTURE:
+#     rostopic echo -n1 /camera/color/camera_info
+# ---------------------------------------------------------------------------
+cam_fx: 605.55712890625
+cam_fy: 605.573974609375
+cam_cx: 324.37408447265625
+cam_cy: 237.1529083251953
+# Distortion coefficients (k1, k2, p1, p2) from D array  D: [k1, k2, p1, p2, k3]
+cam_d0: 0.0
+cam_d1: 0.0
+cam_d2: 0.0
+cam_d3: 0.0
