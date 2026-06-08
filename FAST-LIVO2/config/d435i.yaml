@@ -1,6 +1,6 @@
 common:
-  img_topic: "/camera/color/image_raw"
-  lid_topic: "/camera/depth/color/points"  # PointCloud2 from aligned depth
+  img_topic: "/camera/color/image_raw_10hz"      # 10Hz throttle in d435i.launch (full-rate: /camera/color/image_raw)
+  lid_topic: "/camera/depth/color/points_10hz"   # 10Hz throttle in d435i.launch; PointCloud2 from aligned depth
   imu_topic: "/camera/imu"  # Combined IMU topic (gyro + accel)
   img_en: 1
   lidar_en: 1
