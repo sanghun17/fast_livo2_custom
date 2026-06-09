@@ -118,6 +118,7 @@ public:
 
   int frame_count = 0;
   bool plot_flag;
+  bool verbose = false;   // gate per-frame VIO console spam (injected from LIVMapper debug/verbose)
 
   Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;

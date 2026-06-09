@@ -5,6 +5,16 @@ common:
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
+  # --- Online camera intrinsics ---------------------------------------------
+  # At startup FAST-LIVO grabs ONE CameraInfo msg from cam_info_topic in C++
+  # (ros::topic::waitForMessage in LIVMapper::initializeComponents) and builds the
+  # camera model from it, so intrinsics always match whatever resolution the camera
+  # actually came up at. Falls back to camera_d435i.yaml if no msg within timeout.
+  # NOTE: img_topic above is the 10Hz throttle, but camera_info is full-rate and
+  # NOT throttled -> point cam_info_topic at the un-throttled /camera/color/camera_info.
+  online_intrinsics_en: true
+  cam_info_topic: "/camera/color/camera_info"
+  cam_info_timeout: 5.0
 
 # ===========================================================================
 # Intel RealSense D435i  (serial 109622074087) on Jetson Orin AGX

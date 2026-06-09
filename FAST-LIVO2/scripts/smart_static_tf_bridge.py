@@ -240,42 +240,60 @@ class SmartStaticTFBridge:
         return solution
 
     def run(self):
-        """Main execution."""
+        """Main execution: retry until the full tree (verify_root -> child) resolves.
 
-        # Wait for TF tree to populate
+        One-shot publishing races a still-forming camera tree on startup (especially
+        under CPU load): the bridge can fire before the RealSense static TFs are
+        visible, so find_root() prematurely returns the child itself and we publish a
+        direct aft_mapped->child that later COLLIDES with the child's real parent ->
+        a split/conflicting tree (the "odom and camera_depth_optical_frame not
+        connected" symptom). So instead of a magic sleep, keep recomputing and
+        republishing (static sendTransform is idempotent) and only stop once
+        verify_root->child looks up end-to-end -- which also proves the live
+        camera_init->aft_mapped link from LIO is up, not just our own static.
+        """
+        verify_root = rospy.get_param('~verify_root', 'odom')
         rospy.loginfo("\nWaiting for TF tree to populate...")
-        rospy.sleep(5.0)  # Give TF buffer time to cache all transforms
+        rospy.sleep(2.0)  # brief settle; the retry loop below handles the rest
 
-        # Wait for child frame (parent frame might not exist yet)
-        if not self.wait_for_frame(self.child_frame, timeout=10.0):
-            rospy.logerr("Cannot proceed without child frame. Exiting.")
-            return
+        rate = rospy.Rate(0.5)  # retry every 2s
+        published = False
+        while not rospy.is_shutdown():
+            # Need the child frame before we can find its root.
+            if self.child_frame not in self.tf_buffer.all_frames_as_string():
+                rospy.loginfo_throttle(10, f"Waiting for child frame '{self.child_frame}'...")
+                rate.sleep()
+                continue
 
-        # Calculate solution
-        solution = self.calculate_solution()
+            # Guard the startup race: if find_root() still thinks the child is its own
+            # root, the camera tree's static TFs aren't visible yet. Publishing now
+            # would latch a wrong-root transform that conflicts once they appear.
+            if self.find_root(self.child_frame) == self.child_frame:
+                rospy.loginfo_throttle(10, f"Camera tree for '{self.child_frame}' not formed yet; retrying...")
+                rate.sleep()
+                continue
 
-        if solution is None:
-            rospy.logerr("Failed to calculate solution. Exiting.")
-            return
+            solution = self.calculate_solution()
+            if solution is None:
+                rate.sleep()
+                continue
 
-        # Publish static transform
-        rospy.loginfo("\n" + "=" * 60)
-        rospy.loginfo("Step 3: Publishing static transform")
-        rospy.loginfo("=" * 60)
-        rospy.loginfo(f"Publishing: {solution.header.frame_id} → {solution.child_frame_id}")
-        t = solution.transform
-        rospy.loginfo(f"  Translation: [{t.translation.x:.4f}, {t.translation.y:.4f}, {t.translation.z:.4f}]")
-        rospy.loginfo(f"  Rotation: [{t.rotation.x:.4f}, {t.rotation.y:.4f}, {t.rotation.z:.4f}, {t.rotation.w:.4f}]")
+            self.static_broadcaster.sendTransform(solution)
+            if not published:
+                rospy.loginfo(f"Published {solution.header.frame_id} -> {solution.child_frame_id}; "
+                              f"verifying {verify_root} -> {self.child_frame} ...")
+                published = True
 
-        self.static_broadcaster.sendTransform(solution)
+            # End-to-end check: confirms aft_mapped is linked all the way to the global
+            # root (live LIO odometry), not just to our own static transform.
+            if self.lookup_transform_safe(verify_root, self.child_frame, timeout=1.0) is not None:
+                rospy.loginfo(f"✓ TF tree connected: {verify_root} -> {self.child_frame}. Holding transform.")
+                break
 
-        rospy.loginfo("\n✓ Static transform published successfully!")
-        rospy.loginfo("=" * 60)
-        rospy.loginfo("Static transform is latched on /tf_static topic.")
-        rospy.loginfo("Node will stay alive to keep the transform available.")
-        rospy.loginfo("=" * 60)
+            rospy.loginfo_throttle(10, f"Published, but {verify_root} -> {self.child_frame} not resolvable yet; retrying...")
+            rate.sleep()
 
-        # Keep node alive to maintain the static transform
+        # Keep node alive to maintain the latched static transform.
         rospy.spin()
 
 

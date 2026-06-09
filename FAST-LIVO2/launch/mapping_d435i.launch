@@ -17,16 +17,25 @@
 	<!-- Load Fast-LIVO2 main config for D435i -->
 	<rosparam command="load" file="$(find fast_livo)/config/d435i.yaml" />
 
+	<!-- Camera intrinsics come ONLINE from /camera/color/camera_info at startup
+	     (see d435i.yaml common/online_intrinsics_en). This only NAMES the offline
+	     fallback file; it is deliberately NOT rosparam-loaded here. LIVMapper loads it
+	     itself, and ONLY if the camera_info topic is absent -> when online works, no
+	     (stale) cam_* params ever appear on the param server. -->
+	<param name="common/cam_calib_file" value="$(find fast_livo)/config/camera_d435i.yaml" />
+
+	<!-- Per-frame VIO/LIO timing-table + feature-count console spam: true=on, false=quiet.
+	     Read once at startup as rosparam debug/verbose; flip this and just re-run (NO rebuild). -->
+	<param name="debug/verbose" value="false" />
+
 	<!-- Fast-LIVO2 mapping node.
 	     launch-prefix "nice -n -15": the LIO/VIO loop is single-threaded (ros::spinOnce
 	     in run()), so a CPU burst from launching voxblox/planner can preempt it, stall
 	     the loop, and cause "IMU and LiDAR not synced" delta spikes. High CFS priority
 	     keeps it scheduled through those bursts. (RT/chrt is blocked here: the container
 	     cgroup has cpu.rt_runtime_us=0, so SCHED_FIFO -> EPERM.) -->
-	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="log"
-	      launch-prefix="nice -n -15">
-		<rosparam file="$(find fast_livo)/config/camera_d435i.yaml" />
-	</node>
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen"
+	      launch-prefix="nice -n -15" />
 
 	<!-- Smart TF Bridge: Connects LIVO and RealSense TF trees -->
 	<node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
