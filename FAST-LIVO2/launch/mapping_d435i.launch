@@ -29,13 +29,21 @@
 	<param name="debug/verbose" value="false" />
 
 	<!-- Fast-LIVO2 mapping node.
-	     launch-prefix "nice -n -15": the LIO/VIO loop is single-threaded (ros::spinOnce
-	     in run()), so a CPU burst from launching voxblox/planner can preempt it, stall
-	     the loop, and cause "IMU and LiDAR not synced" delta spikes. High CFS priority
-	     keeps it scheduled through those bursts. (RT/chrt is blocked here: the container
+	     taskset CPUS_FASTLIVO (config/ros_env.sh — $(env) = HARD requirement, this
+	     launch refuses to start without ros_env.sh sourced): EXCLUSIVE cores.
+	     The LIO/VIO loop is single-threaded (ros::spinOnce in run()) and measured
+	     ~0.5 core, so 2 dedicated cores cover it; the pool (4-11) and the camera
+	     (0-1) are pinned OFF them, so voxblox/planner/JAX startup bursts can no
+	     longer stall the loop ("IMU and LiDAR not synced" delta spikes) — and this
+	     node's own nice'd startup burst can no longer preempt the camera's
+	     libusb/uvc threads -> "uvc streamer watchdog" -> 10-25s depth/color outage
+	     (verified live: watchdog fired 2s after an unfenced start, "not synced"
+	     storm lasted exactly until the streams came back).
+	     nice -n -15: kept as insurance against UNPINNED strays (debug shells,
+	     rostopic) landing on these cores. (RT/chrt is blocked here: the container
 	     cgroup has cpu.rt_runtime_us=0, so SCHED_FIFO -> EPERM.) -->
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen"
-	      launch-prefix="nice -n -15" />
+	      launch-prefix="taskset -c $(env CPUS_FASTLIVO) nice -n -15" />
 
 	<!-- Smart TF Bridge: Connects LIVO and RealSense TF trees -->
 	<node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
