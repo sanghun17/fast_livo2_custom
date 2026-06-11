@@ -58,4 +58,14 @@
 		<param name="qw" value="1.0" />
 	</node>
 
+	<!-- Divergence guard: if |pos| ever exceeds max_dist the estimate has already
+	     diverged (and voxblox would allocate blocks along the runaway ray until
+	     RAM dies) -> rosnode kill laserMapping, loud FATAL in the log.
+	     Disable deliberately with enabled=false for large-motion tests. -->
+	<node pkg="fast_livo" type="odom_guard.py" name="odom_guard" output="screen">
+		<param name="max_dist" value="100.0" />
+		<param name="kill_node" value="/laserMapping" />
+		<param name="enabled" value="true" />
+	</node>
+
 </launch>
