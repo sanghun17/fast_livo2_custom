@@ -11,6 +11,42 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include <sensor_msgs/CameraInfo.h>
+#include <ros/topic.h>
+#include <cstdlib>
+
+namespace {
+// Pick the vikit camera model from a distortion-model string and build it.
+// radtan/plumb_bob (and empty) -> PinholeCamera; fisheye/equidistant -> EquidistantCamera.
+vk::AbstractCamera *makeCamera(const std::string &dist_model, double w, double h, double scale,
+                               double fx, double fy, double cx, double cy,
+                               double d0, double d1, double d2, double d3)
+{
+  if (dist_model == "equidistant" || dist_model == "fisheye" || dist_model == "EquidistantCamera")
+    return new vk::EquidistantCamera(w, h, scale, fx, fy, cx, cy, d0, d1, d2, d3);
+  return new vk::PinholeCamera(w, h, scale, fx, fy, cx, cy, d0, d1, d2, d3);
+}
+
+// Online intrinsics: build the camera straight from a CameraInfo message.
+// K = [fx 0 cx; 0 fy cy; 0 0 1]; D = distortion coeffs. `scale` is FAST-LIVO's
+// image-downsample factor (not in CameraInfo), passed through.
+bool buildCameraFromInfo(const sensor_msgs::CameraInfo &ci, double scale, vk::AbstractCamera *&cam)
+{
+  if (ci.width == 0 || ci.height == 0 || ci.K[0] == 0.0)
+  {
+    ROS_ERROR_STREAM("[camera] CameraInfo has no valid intrinsics (width=" << ci.width << ", K[0]=" << ci.K[0] << ")");
+    return false;
+  }
+  auto D = [&](size_t i) { return i < ci.D.size() ? ci.D[i] : 0.0; };
+  cam = makeCamera(ci.distortion_model, ci.width, ci.height, scale, ci.K[0], ci.K[4], ci.K[2], ci.K[5],
+                   D(0), D(1), D(2), D(3));
+  ROS_INFO_STREAM("[camera] online intrinsics from topic: "
+                  << (ci.distortion_model.empty() ? "(none)" : ci.distortion_model) << " " << ci.width << "x"
+                  << ci.height << "  fx=" << ci.K[0] << " fy=" << ci.K[4] << " cx=" << ci.K[2] << " cy=" << ci.K[5]
+                  << "  D=[" << D(0) << ", " << D(1) << ", " << D(2) << ", " << D(3) << "]");
+  return true;
+}
+} // namespace
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -55,6 +91,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+  nh.param<bool>("common/online_intrinsics_en", online_intrinsics_en, false);
+  nh.param<string>("common/cam_info_topic", cam_info_topic, "");
+  nh.param<double>("common/cam_info_timeout", cam_info_timeout, 5.0);
+  nh.param<string>("common/cam_calib_file", cam_calib_file, "");
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -103,6 +143,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<vector<double>>("extrin_calib/Rcl", cameraextrinR, vector<double>());
   nh.param<double>("debug/plot_time", plot_time, -10);
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
+  nh.param<bool>("debug/verbose", verbose, false);   // per-frame VIO/LIO console spam on/off (set in launch, no rebuild)
 
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
@@ -120,9 +161,45 @@ void LIVMapper::initializeComponents()
 
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
+  voxelmap_manager->verbose = verbose;
 
-  if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
+  // Camera intrinsics: prefer a one-shot CameraInfo from the live topic so they always
+  // match the resolution the camera actually started at. Only if that topic is absent do
+  // we fall back to the static calib file (common/cam_calib_file) -- and the file is NOT
+  // rosparam-loaded by the launch; we load it here, on demand, so when the online path
+  // works no (potentially stale) cam_* params ever land on the param server.
+  bool cam_loaded = false;
+  if (img_en != 0 && online_intrinsics_en)
+  {
+    std::string ci_topic = cam_info_topic;
+    if (ci_topic.empty()) // derive "<prefix>/camera_info" from img_topic
+    {
+      size_t slash = img_topic.find_last_of('/');
+      ci_topic = (slash == std::string::npos) ? "/camera/color/camera_info"
+                                              : img_topic.substr(0, slash) + "/camera_info";
+    }
+    ROS_INFO_STREAM("[camera] trying online intrinsics: waiting up to " << cam_info_timeout << "s for CameraInfo on " << ci_topic);
+    auto ci = ros::topic::waitForMessage<sensor_msgs::CameraInfo>(ci_topic, ros::Duration(cam_info_timeout));
+    if (ci)
+    {
+      double scale = 1.0;
+      ros::param::get("laserMapping/scale", scale);
+      cam_loaded = buildCameraFromInfo(*ci, scale, vio_manager->cam);
+    }
+    else if (!cam_calib_file.empty())
+    {
+      // No live topic -> load the named calib yaml into this node's namespace NOW, then
+      // let vikit build the model from those params (same path other configs use).
+      ROS_WARN_STREAM("[camera] no CameraInfo on " << ci_topic << " within " << cam_info_timeout
+                      << "s; loading static intrinsics from " << cam_calib_file);
+      std::string cmd = "rosparam load '" + cam_calib_file + "' /laserMapping";
+      if (system(cmd.c_str()) != 0) ROS_ERROR_STREAM("[camera] '" << cmd << "' failed");
+    }
+  }
+  if (!cam_loaded && !vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam))
+    throw std::runtime_error("Camera model not correctly specified (no CameraInfo, no usable calib file).");
 
+  vio_manager->verbose = verbose;
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
   vio_manager->outlier_threshold = outlier_threshold;
@@ -295,7 +372,7 @@ void LIVMapper::handleVIO()
     return;
   }
 
-  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
+  if (verbose) std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
   // ROS_WARN("[DBG-VIO] 2: before processFrame");
 
   if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1))
@@ -421,7 +498,7 @@ void LIVMapper::handleLIO()
     voxelmap_manager->pv_list_[i].var = var;
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  if (verbose) std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
@@ -460,6 +537,8 @@ void LIVMapper::handleLIO()
   // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
   //         "\033[1;36m[ LIO mapping time ]: average: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n",
   //         t2 - t1, t4 - t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
+  if (verbose)
+  {
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
@@ -472,6 +551,7 @@ void LIVMapper::handleLIO()
   printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
   printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  }
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "

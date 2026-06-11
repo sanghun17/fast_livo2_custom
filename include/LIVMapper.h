@@ -75,6 +75,12 @@ public:
   
   string root_dir;
   string lid_topic, imu_topic, seq_name, img_topic;
+  // Online camera intrinsics: grab one CameraInfo at init; the static yaml named by
+  // cam_calib_file is loaded on demand only when the topic is absent.
+  string cam_info_topic;
+  string cam_calib_file;
+  bool online_intrinsics_en = false;
+  double cam_info_timeout = 5.0;
   V3D extT;
   M3D extR;
 
@@ -124,6 +130,7 @@ public:
   double outlier_threshold;
   double plot_time;
   int frame_cnt;
+  bool verbose = false;   // debug/verbose: gate per-frame VIO/LIO console spam (rosparam, set in launch, no rebuild)
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;

@@ -199,6 +199,7 @@ public:
 
   M3D extR_;
   V3D extT_;
+  bool verbose = false;   // gate per-frame LIO console spam (injected from LIVMapper debug/verbose)
   float build_residual_time, ekf_time;
   float ave_build_residual_time = 0.0;
   float ave_ekf_time = 0.0;
