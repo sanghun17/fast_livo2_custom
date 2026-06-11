@@ -167,6 +167,7 @@ public:
   
   double blind, blind_sqr;
   bool feature_enabled, given_offset_time;
+  bool verbose = false;   // gate per-cloud "pl size::" spam (injected from LIVMapper debug/verbose)
   ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
