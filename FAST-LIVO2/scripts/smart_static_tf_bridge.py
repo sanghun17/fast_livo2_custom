@@ -88,43 +88,39 @@ class SmartStaticTFBridge:
         return False
 
     def find_root(self, frame_id):
-        """Find the root frame of a TF tree by traversing parents."""
+        """Find the root frame of a TF tree by traversing parents.
+
+        Reads parentage from the accumulated tf_buffer (all_frames_as_yaml), which
+        holds EVERY latched static + dynamic transform the listener has seen.
+        Do NOT use wait_for_message('/tf_static'): that returns ONE message from
+        ONE publisher — with several static broadcasters up (camera, mavros, this
+        bridge), whichever answers first wins, and if it is e.g. mavros's
+        (map_ned/odom_ned), the camera frames are absent from it and the child is
+        misdeclared a root -> the run() guard then retries forever ("Camera tree
+        not formed yet" loop) even though the tree is fully formed.
+        """
+        import yaml
+        try:
+            frames = yaml.safe_load(self.tf_buffer.all_frames_as_yaml()) or {}
+        except Exception as e:
+            rospy.logwarn(f"all_frames_as_yaml parse failed: {e}")
+            frames = {}
+
         current = frame_id
-        visited = set()
         path = [current]
-
-        while current not in visited and not rospy.is_shutdown():
-            visited.add(current)
-
-            # Try to find parent by checking /tf_static
-            try:
-                msg = rospy.wait_for_message('/tf_static', TFMessage, timeout=2.0)
-                parent_found = None
-
-                for transform in msg.transforms:
-                    if transform.child_frame_id == current:
-                        parent_found = transform.header.frame_id
-                        break
-
-                if parent_found is None:
-                    # No parent, this is the root
-                    rospy.loginfo(f"  Root of '{frame_id}': '{current}'")
-                    if len(path) > 1:
-                        rospy.loginfo(f"  Path: {' → '.join(reversed(path))}")
-                    return current
-
-                # Continue up the tree
-                path.append(parent_found)
-                current = parent_found
-
-            except Exception as e:
-                # Timeout or error, assume this is the root
-                rospy.loginfo(f"  Root of '{frame_id}': '{current}' (no parent found)")
+        while not rospy.is_shutdown():
+            info = frames.get(current)
+            parent = info.get('parent') if isinstance(info, dict) else None
+            if not parent:
+                rospy.loginfo(f"  Root of '{frame_id}': '{current}'")
                 if len(path) > 1:
                     rospy.loginfo(f"  Path: {' → '.join(reversed(path))}")
                 return current
-
-        rospy.logwarn(f"Cycle detected in TF tree at '{current}'")
+            if parent in path:
+                rospy.logwarn(f"Cycle detected in TF tree at '{parent}'")
+                return current
+            path.append(parent)
+            current = parent
         return current
 
     def transform_to_matrix(self, trans):
