@@ -96,6 +96,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("common/cam_info_timeout", cam_info_timeout, 5.0);
   nh.param<string>("common/cam_calib_file", cam_calib_file, "");
 
+  // OptiTrack/mocap gt-init: the first pose on this topic latches odom->camera_init
+  // (gt_odom_cbk). Always subscribed; self-activates when mocap is publishing.
+  nh.param<string>("mocap/gt_pose_topic", gt_pose_topic, "/vrpn_client_node/pure/pose");
+
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
   nh.param<int>("vio/max_iterations", max_iterations, 5);
@@ -269,7 +273,14 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
             nh.subscribe(lid_topic, 10, &LIVMapper::standard_pcl_cbk, this);  // [jetson] was 200000: tiny queue drops stale clouds under CPU load instead of buffering -> instant recovery after a stall (no slow backlog grind). See mapping_d435i.launch launch-prefix.
   sub_imu = nh.subscribe(imu_topic, 2000, &LIVMapper::imu_cbk, this);  // [jetson] was 200000: keep ~10s of IMU (cheap to drain, avoids propagation gaps) but bounded.
   sub_img = nh.subscribe(img_topic, 10, &LIVMapper::img_cbk, this);  // [jetson] was 200000: small queue, drop stale frames under load.
-  
+  sub_reinit = nh.subscribe("/livo/reinit", 1, &LIVMapper::reinit_cbk, this);  // re-anchor trigger
+  // Always subscribe (like sim `ml`): the first pose that arrives latches
+  // odom->camera_init (gt_odom_cbk). If mocap never publishes, the hardcoded fallback
+  // in publish_odometry_odom is used. Self-selects at runtime — no enable flag.
+  sub_gt_odom = nh.subscribe(gt_pose_topic, 1, &LIVMapper::gt_odom_cbk, this);
+  ROS_INFO("[mocap] gt-init armed: first pose on %s sets odom->camera_init (else hardcoded fallback)",
+           gt_pose_topic.c_str());
+
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
   pubSubVisualMap = nh.advertise<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 100);
@@ -695,18 +706,51 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
     posi = imu_propagate.pos_end;
     vel_i = imu_propagate.vel_end;
     q = Eigen::Quaterniond(imu_propagate.rot_end);
-    imu_prop_odom.header.frame_id = "world";
     imu_prop_odom.header.stamp = newest_imu.header.stamp;
-    imu_prop_odom.pose.pose.position.x = posi.x();
-    imu_prop_odom.pose.pose.position.y = posi.y();
-    imu_prop_odom.pose.pose.position.z = posi.z();
-    imu_prop_odom.pose.pose.orientation.w = q.w();
-    imu_prop_odom.pose.pose.orientation.x = q.x();
-    imu_prop_odom.pose.pose.orientation.y = q.y();
-    imu_prop_odom.pose.pose.orientation.z = q.z();
-    imu_prop_odom.twist.twist.linear.x = vel_i.x();
-    imu_prop_odom.twist.twist.linear.y = vel_i.y();
-    imu_prop_odom.twist.twist.linear.z = vel_i.z();
+    tf::Quaternion q_otc;  // odom<-camera_init rotation; used by both pose and twist below
+    if (gt_odom_received) {
+      // Mocap gt-init: transform the camera_init-frame propagated pose into odom,
+      // so /LIVO2/imu_propagate starts at the true mocap pose (matches the sim `ml`
+      // branch). odom_pose = odom_to_camera_init * camera_init_pose.
+      tf::Transform odom_to_cam_init_tf;
+      odom_to_cam_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
+                                                odom_to_camera_init.translation.y,
+                                                odom_to_camera_init.translation.z));
+      q_otc = tf::Quaternion(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
+                             odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
+      odom_to_cam_init_tf.setRotation(q_otc);
+      tf::Transform cam_init_pose_tf;
+      cam_init_pose_tf.setOrigin(tf::Vector3(posi.x(), posi.y(), posi.z()));
+      cam_init_pose_tf.setRotation(tf::Quaternion(q.x(), q.y(), q.z(), q.w()));
+      tf::Transform odom_pose_tf = odom_to_cam_init_tf * cam_init_pose_tf;
+      tf::Vector3 p = odom_pose_tf.getOrigin();
+      tf::Quaternion qt = odom_pose_tf.getRotation();
+      imu_prop_odom.header.frame_id = "odom";
+      imu_prop_odom.child_frame_id = "base_link";
+      imu_prop_odom.pose.pose.position.x = p.x();
+      imu_prop_odom.pose.pose.position.y = p.y();
+      imu_prop_odom.pose.pose.position.z = p.z();
+      imu_prop_odom.pose.pose.orientation.x = qt.x();
+      imu_prop_odom.pose.pose.orientation.y = qt.y();
+      imu_prop_odom.pose.pose.orientation.z = qt.z();
+      imu_prop_odom.pose.pose.orientation.w = qt.w();
+      tf::Vector3 vel_odom = tf::quatRotate(q_otc, tf::Vector3(vel_i.x(), vel_i.y(), vel_i.z()));
+      imu_prop_odom.twist.twist.linear.x = vel_odom.x();
+      imu_prop_odom.twist.twist.linear.y = vel_odom.y();
+      imu_prop_odom.twist.twist.linear.z = vel_odom.z();
+    } else {
+      imu_prop_odom.header.frame_id = "world";
+      imu_prop_odom.pose.pose.position.x = posi.x();
+      imu_prop_odom.pose.pose.position.y = posi.y();
+      imu_prop_odom.pose.pose.position.z = posi.z();
+      imu_prop_odom.pose.pose.orientation.w = q.w();
+      imu_prop_odom.pose.pose.orientation.x = q.x();
+      imu_prop_odom.pose.pose.orientation.y = q.y();
+      imu_prop_odom.pose.pose.orientation.z = q.z();
+      imu_prop_odom.twist.twist.linear.x = vel_i.x();
+      imu_prop_odom.twist.twist.linear.y = vel_i.y();
+      imu_prop_odom.twist.twist.linear.z = vel_i.z();
+    }
     pubImuPropOdom.publish(imu_prop_odom);
   }
   mtx_buffer_imu_prop.unlock();
@@ -1374,39 +1418,50 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 
 void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom)
 {
-  // ---------------------------------------------------------------------
-  // 목표:
-  // Step 1: Position 유지, Orientation만 회전 (camera_init frame에서)
-  // Step 2: Full transform 적용하여 odom frame으로 변환
-  // ---------------------------------------------------------------------
-
-  // Static transform: odom -> camera_init with Q(0.5, -0.5, 0.5, -0.5)
-  tf::Transform T_odom_camera_init;
-  T_odom_camera_init.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
-  T_odom_camera_init.setRotation(tf::Quaternion(0.5, -0.5, 0.5, -0.5));
-
-  tf::Quaternion q_camera_init_to_odom = T_odom_camera_init.getRotation().inverse();
-
-  // Step 1: Orientation을 odom 축 기준으로 re-express (camera_init frame에서)
-  tf::Quaternion rot_camera_init(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
-  tf::Quaternion rot_reoriented = rot_camera_init * q_camera_init_to_odom;
-
-  // Step 2: Full transform - camera_init frame에서 odom frame으로 변환
-  // Camera_init frame에서의 pose
-  tf::Transform T_camera_init_body;
+  // Transform the camera_init-frame body pose into odom and publish /aft_mapped_to_odom.
+  //   odom_body = T_odom_camera_init * T_camera_init_body
+  // Two sources for T_odom_camera_init:
+  //   gt_odom_received -> latched mocap pose (gt_odom_cbk); body orientation used as-is
+  //                       (the latch carries the full odom<-camera_init relation). The TF
+  //                       is broadcast here so rviz (Fixed Frame=odom) connects the tree.
+  //   else             -> hardcoded optical-axis flip Q(0.5,-0.5,0.5,-0.5), zero translation
+  //                       (camera_init optical Z/X/Y -> ROS X/Y/Z); the odom->camera_init TF
+  //                       then comes from the launch static_transform_publisher.
+  tf::Transform T_odom_camera_init, T_camera_init_body;
   T_camera_init_body.setOrigin(tf::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
-  T_camera_init_body.setRotation(rot_reoriented);  // Re-oriented orientation 사용
 
-  // Odom frame으로 transform: T_odom_body = T_odom_camera_init * T_camera_init_body
+  if (gt_odom_received) {
+    T_odom_camera_init.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
+                                             odom_to_camera_init.translation.y,
+                                             odom_to_camera_init.translation.z));
+    // internal pose is in the OPTICAL camera_init frame (gravity_align off); apply the same
+    // optical->ROS conjugation the fallback uses, anchored to the vrpn world pose. Without the
+    // flip vertical motion leaks horizontal; without the inverse the attitude keeps a ~90deg offset.
+    tf::Quaternion q_vrpn(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
+                          odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
+    tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);
+    T_odom_camera_init.setRotation(q_vrpn * q_o2r);
+    T_camera_init_body.setRotation(tf::Quaternion(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w) * q_o2r.inverse());
+  } else {
+    T_odom_camera_init.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
+    T_odom_camera_init.setRotation(tf::Quaternion(0.5, -0.5, 0.5, -0.5));
+    tf::Quaternion q_camera_init_to_odom = T_odom_camera_init.getRotation().inverse();
+    tf::Quaternion rot_camera_init(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
+    T_camera_init_body.setRotation(rot_camera_init * q_camera_init_to_odom);
+  }
+
+  // LIVMapper OWNS the odom->camera_init edge in BOTH cases (gt-latched pose, or the
+  // hardcoded flip as fallback). Because it is always published here, the launch no
+  // longer needs a static_transform_publisher and the gt subscriber can stay always-on.
+  static tf::TransformBroadcaster br_odom;
+  br_odom.sendTransform(tf::StampedTransform(T_odom_camera_init, ros::Time::now(), "odom", "camera_init"));
+
   tf::Transform T_odom_body = T_odom_camera_init * T_camera_init_body;
-
-  // Extract final pose in odom frame
   tf::Vector3 pos_in_odom = T_odom_body.getOrigin();
   tf::Quaternion rot_in_odom = T_odom_body.getRotation();
 
-  // Publish in odom frame
   nav_msgs::Odometry odomInOdom;
-  odomInOdom.header.frame_id = "odom";  // Now in odom frame!
+  odomInOdom.header.frame_id = "odom";
   odomInOdom.child_frame_id = "camera_link";
   odomInOdom.header.stamp = ros::Time::now();
 
@@ -1420,6 +1475,41 @@ void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom
   odomInOdom.pose.pose.orientation.w = rot_in_odom.w();
 
   pubOdomAftMappedOdom.publish(odomInOdom);
+}
+
+// Mocap gt-init (ported from sim `ml`): the FIRST pose on gt_pose_topic defines
+// odom -> camera_init. The internal EKF state is NOT changed — it stays at the
+// camera_init origin (so /aft_mapped_to_init is still 0,0,0 at boot); instead the
+// odom-frame publishers (publish_odometry_odom, imu_prop_callback) multiply by this
+// latched transform so their output starts at the true mocap pose.
+void LIVMapper::gt_odom_cbk(const geometry_msgs::PoseStamped::ConstPtr &msg_in)
+{
+  if (gt_odom_received) return;  // first message only
+  odom_to_camera_init.translation.x = msg_in->pose.position.x;
+  odom_to_camera_init.translation.y = msg_in->pose.position.y;
+  odom_to_camera_init.translation.z = msg_in->pose.position.z;
+  odom_to_camera_init.rotation = msg_in->pose.orientation;
+  gt_odom_received = true;
+  ROS_INFO("[mocap] latched odom->camera_init from gt pose [%.3f, %.3f, %.3f]",
+           odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
+           odom_to_camera_init.translation.z);
+}
+
+// Re-anchor on demand: reset LIVO state and re-latch on the next gt pose. Trigger with
+//   rostopic pub -1 /livo/reinit std_msgs/Empty {}
+// (sim `ml` does this via dynamic_reconfigure reinitialize_with_gt_odom; an Empty topic
+// is the same reset with no extra build dependency).
+void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
+{
+  ROS_WARN("[mocap] reinit requested: resetting LIVO state, re-latch on next gt pose");
+  gt_odom_received = false;
+  p_imu->Reset();
+  _state.resetpose();
+  vio_manager->resetGrid();
+  vio_manager->visual_submap->reset();
+  lidar_map_inited = false;
+  ekf_finish_once = false;
+  is_first_frame = true;
 }
 
 void LIVMapper::publish_mavros(const ros::Publisher &mavros_pose_publisher)
