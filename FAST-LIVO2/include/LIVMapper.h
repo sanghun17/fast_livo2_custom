@@ -187,6 +187,10 @@ public:
   bool gt_odom_received = false;
   std::string gt_pose_topic;
   geometry_msgs::Transform odom_to_camera_init;
+  // gravity_align=on path: z-up internal frame needs odom<-camera_init = vrpn_init * inv(body_at_init),
+  // latched once at first publish (no fixed optical flip). See publish_odometry_odom.
+  bool grav_anchor_latched = false;
+  geometry_msgs::Transform odom_to_camera_init_grav;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;

@@ -1431,17 +1431,50 @@ void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom
   T_camera_init_body.setOrigin(tf::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
 
   if (gt_odom_received) {
-    T_odom_camera_init.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
-                                             odom_to_camera_init.translation.y,
-                                             odom_to_camera_init.translation.z));
-    // internal pose is in the OPTICAL camera_init frame (gravity_align off); apply the same
-    // optical->ROS conjugation the fallback uses, anchored to the vrpn world pose. Without the
-    // flip vertical motion leaks horizontal; without the inverse the attitude keeps a ~90deg offset.
     tf::Quaternion q_vrpn(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
                           odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
-    tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);
-    T_odom_camera_init.setRotation(q_vrpn * q_o2r);
-    T_camera_init_body.setRotation(tf::Quaternion(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w) * q_o2r.inverse());
+    tf::Quaternion q_body(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
+    if (gravity_align_en) {
+      // gravity_align ON: internal camera_init is z-up (gravity-aligned, arbitrary yaw), NOT optical,
+      // so the fixed optical flip is wrong. Anchor odom<-camera_init = vrpn_init * inv(body_at_init),
+      // latched once AFTER gravity alignment finishes (geoQuat then = the static init orientation);
+      // auto-adapts the heading. Before the latch (ground init, no motion) use the raw vrpn pose.
+      // WIP (2026-06-22): this fixes /aft_mapped_to_odom ATTITUDE (init err 89deg->~4deg) but the
+      // published POSITION still carries a ~1m offset vs GT (pos_end at latch is ~0, so not that;
+      // root cause unresolved). gravity_align ON improves the ESTIMATOR (climb scale 0.74->0.92,
+      // see DEBUG_JOURNAL) but is NOT yet a complete odom path -> keep gravity_align_en=false default
+      // (the verified optical-flip OFF path below). Finish the position anchor before enabling.
+      if (!grav_anchor_latched && gravity_align_finished) {
+        tf::Quaternion qr = q_vrpn * q_body.inverse();
+        // full anchor = vrpn_init * inv(T_camera_init_body_at_latch): subtract R(qr)*pos_end so that
+        // published(latch) == vrpn exactly even if pos_end has drifted from 0 by the latch instant.
+        tf::Vector3 pe(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2));
+        tf::Vector3 t_anchor(odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
+                             odom_to_camera_init.translation.z);
+        t_anchor -= tf::quatRotate(qr, pe);
+        ROS_INFO("[mocap] grav anchor latched: |pos_end|=%.3f m, yaw_corr applied", pe.length());
+        odom_to_camera_init_grav.translation.x = t_anchor.x();
+        odom_to_camera_init_grav.translation.y = t_anchor.y();
+        odom_to_camera_init_grav.translation.z = t_anchor.z();
+        odom_to_camera_init_grav.rotation.x = qr.x(); odom_to_camera_init_grav.rotation.y = qr.y();
+        odom_to_camera_init_grav.rotation.z = qr.z(); odom_to_camera_init_grav.rotation.w = qr.w();
+        grav_anchor_latched = true;
+      }
+      const geometry_msgs::Transform &A = grav_anchor_latched ? odom_to_camera_init_grav : odom_to_camera_init;
+      T_odom_camera_init.setOrigin(tf::Vector3(A.translation.x, A.translation.y, A.translation.z));
+      T_odom_camera_init.setRotation(tf::Quaternion(A.rotation.x, A.rotation.y, A.rotation.z, A.rotation.w));
+      T_camera_init_body.setRotation(q_body);
+    } else {
+      // gravity_align OFF: internal pose is in the OPTICAL camera_init frame; apply the optical->ROS
+      // conjugation the fallback uses, anchored to the vrpn world pose. Without the flip vertical motion
+      // leaks horizontal; without the inverse the attitude keeps a ~90deg offset.
+      tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);
+      T_odom_camera_init.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
+                                               odom_to_camera_init.translation.y,
+                                               odom_to_camera_init.translation.z));
+      T_odom_camera_init.setRotation(q_vrpn * q_o2r);
+      T_camera_init_body.setRotation(q_body * q_o2r.inverse());
+    }
   } else {
     T_odom_camera_init.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
     T_odom_camera_init.setRotation(tf::Quaternion(0.5, -0.5, 0.5, -0.5));
@@ -1503,6 +1536,7 @@ void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
 {
   ROS_WARN("[mocap] reinit requested: resetting LIVO state, re-latch on next gt pose");
   gt_odom_received = false;
+  grav_anchor_latched = false;
   p_imu->Reset();
   _state.resetpose();
   vio_manager->resetGrid();
