@@ -30,7 +30,7 @@ common:
 
 extrin_calib:
   # IMU to LiDAR extrinsic (identity for initial test - needs IMU-camera calibration)
-  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_T: [0.00552, -0.0051, -0.01174]   # real IMU->depth lever arm (from /tf_static; was identity)
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
   # Depth (LiDAR) to Color (Camera) extrinsic.
   # Captured /camera/extrinsics/depth_to_color (D435i, 2026-06-01):
@@ -51,8 +51,8 @@ time_offset:
   exposure_time_init: 0.0
 
 preprocess:
-  point_filter_num: 10
-  filter_size_surf: 0.25
+  point_filter_num: 1    # decim3 cloud ~10.7k pts/frame ~0.6x Mid360 -> keep all (was 10)
+  filter_size_surf: 0.1  # match author avia (was 0.25)
   lidar_type: 4  # 0: Standard PointCloud2, 1: Livox
   scan_line: 1
   blind: 0.2  # Minimum depth (D435i min-Z ~0.105m; 0.2 is conservative)
@@ -75,8 +75,8 @@ imu:
   # Initial values - need Allan variance calibration
   acc_cov: 0.5
   gyr_cov: 0.3
-  b_acc_cov: 0.0001
-  b_gyr_cov: 0.0001
+  b_acc_cov: 0.001       # bias random-walk INFLATED for stability (was 0.0001) -> stops divergence
+  b_gyr_cov: 0.001       # (Allan physical RW ~1.2e-4 but filter needs inflated; small acc/gyr_cov destabilize)
 
 lio:
   max_iterations: 5

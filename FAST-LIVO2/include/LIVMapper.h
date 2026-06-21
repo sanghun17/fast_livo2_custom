@@ -20,6 +20,9 @@ which is included as part of this source code package.
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
 #include <vikit/camera_loader.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Transform.h>
+#include <std_msgs/Empty.h>
 
 class LIVMapper
 {
@@ -49,6 +52,11 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  // OptiTrack/mocap gt-init (ported from the sim `ml` branch): latch odom->camera_init
+  // from the first mocap pose so the published odom-frame topics start at the true pose.
+  void gt_odom_cbk(const geometry_msgs::PoseStamped::ConstPtr &msg_in);
+  // re-anchor on demand (std_msgs/Empty trigger): reset LIVO state, re-latch next pose.
+  void reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -172,6 +180,13 @@ public:
   ros::Subscriber sub_pcl;
   ros::Subscriber sub_imu;
   ros::Subscriber sub_img;
+  ros::Subscriber sub_gt_odom;   // mocap pose -> gt_odom_cbk (always subscribed; self-selects)
+  ros::Subscriber sub_reinit;    // /livo/reinit -> reinit_cbk
+  // mocap gt-init state. odom_to_camera_init holds the latched odom<-camera_init pose;
+  // when gt_odom_received, the odom-frame publishers multiply by it (see publish_odometry_odom).
+  bool gt_odom_received = false;
+  std::string gt_pose_topic;
+  geometry_msgs::Transform odom_to_camera_init;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;
