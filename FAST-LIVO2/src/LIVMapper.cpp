@@ -1452,7 +1452,11 @@ void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom
         tf::Vector3 t_anchor(odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
                              odom_to_camera_init.translation.z);
         t_anchor -= tf::quatRotate(qr, pe);
-        ROS_INFO("[mocap] grav anchor latched: |pos_end|=%.3f m, yaw_corr applied", pe.length());
+        // NOTE (WIP root cause, 2026-06-22): geoQuat at latch has roll ~-90deg (D435i optical y-down ->
+        // gravity-align applies Rx(-90) to reach z-up), so the internal frame is "optical rotated to z-up".
+        // qr = vrpn*inv(geoQuat) does NOT bridge the mocap-body<->IMU-body hand-eye that the OFF path's
+        // q_o2r encodes -> ~1m position offset remains. Finish that hand-eye before enabling gravity_align.
+        ROS_INFO("[mocap] grav anchor latched (|pos_end|=%.3f m); gravity_align odom mapping is WIP", pe.length());
         odom_to_camera_init_grav.translation.x = t_anchor.x();
         odom_to_camera_init_grav.translation.y = t_anchor.y();
         odom_to_camera_init_grav.translation.z = t_anchor.z();
