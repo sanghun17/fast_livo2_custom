@@ -1434,29 +1434,20 @@ void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom
     tf::Quaternion q_vrpn(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
                           odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
     tf::Quaternion q_body(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
+    tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);   // optical->ROS flip (the hand-eye both paths need)
     if (gravity_align_en) {
-      // gravity_align ON: internal camera_init is z-up (gravity-aligned, arbitrary yaw), NOT optical,
-      // so the fixed optical flip is wrong. Anchor odom<-camera_init = vrpn_init * inv(body_at_init),
-      // latched once AFTER gravity alignment finishes (geoQuat then = the static init orientation);
-      // auto-adapts the heading. Before the latch (ground init, no motion) use the raw vrpn pose.
-      // WIP (2026-06-22): this fixes /aft_mapped_to_odom ATTITUDE (init err 89deg->~4deg) but the
-      // published POSITION still carries a ~1m offset vs GT (pos_end at latch is ~0, so not that;
-      // root cause unresolved). gravity_align ON improves the ESTIMATOR (climb scale 0.74->0.92,
-      // see DEBUG_JOURNAL) but is NOT yet a complete odom path -> keep gravity_align_en=false default
-      // (the verified optical-flip OFF path below). Finish the position anchor before enabling.
+      // gravity_align ON: gravityAlignment() left the internal frame at G_R_I0*optical (z-up); measured
+      // geoQuat_init has roll ~-90deg. The OFF path's body rotation is still geoQuat*q_o2r^-1, but the
+      // anchor must additionally undo G_R_I0: deriving T_odom_body = T_odom_ci*T_ci_body with
+      // pos_end_opt = inv(G_R_I0)*pos_end_grav gives anchor rot = q_vrpn * q_o2r * inv(geoQuat_init).
+      // (OFF is the geoQuat_init=identity special case.) Latched once after gravity alignment finishes.
       if (!grav_anchor_latched && gravity_align_finished) {
-        tf::Quaternion qr = q_vrpn * q_body.inverse();
-        // full anchor = vrpn_init * inv(T_camera_init_body_at_latch): subtract R(qr)*pos_end so that
-        // published(latch) == vrpn exactly even if pos_end has drifted from 0 by the latch instant.
+        tf::Quaternion qr = q_vrpn * q_o2r * q_body.inverse();   // q_body here = geoQuat_init
         tf::Vector3 pe(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2));
         tf::Vector3 t_anchor(odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
                              odom_to_camera_init.translation.z);
-        t_anchor -= tf::quatRotate(qr, pe);
-        // NOTE (WIP root cause, 2026-06-22): geoQuat at latch has roll ~-90deg (D435i optical y-down ->
-        // gravity-align applies Rx(-90) to reach z-up), so the internal frame is "optical rotated to z-up".
-        // qr = vrpn*inv(geoQuat) does NOT bridge the mocap-body<->IMU-body hand-eye that the OFF path's
-        // q_o2r encodes -> ~1m position offset remains. Finish that hand-eye before enabling gravity_align.
-        ROS_INFO("[mocap] grav anchor latched (|pos_end|=%.3f m); gravity_align odom mapping is WIP", pe.length());
+        t_anchor -= tf::quatRotate(qr, pe);   // so published(latch) == vrpn even if pos_end drifted from 0
+        ROS_INFO("[mocap] grav anchor latched (|pos_end|=%.3f m)", pe.length());
         odom_to_camera_init_grav.translation.x = t_anchor.x();
         odom_to_camera_init_grav.translation.y = t_anchor.y();
         odom_to_camera_init_grav.translation.z = t_anchor.z();
@@ -1467,12 +1458,11 @@ void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom
       const geometry_msgs::Transform &A = grav_anchor_latched ? odom_to_camera_init_grav : odom_to_camera_init;
       T_odom_camera_init.setOrigin(tf::Vector3(A.translation.x, A.translation.y, A.translation.z));
       T_odom_camera_init.setRotation(tf::Quaternion(A.rotation.x, A.rotation.y, A.rotation.z, A.rotation.w));
-      T_camera_init_body.setRotation(q_body);
+      T_camera_init_body.setRotation(q_body * q_o2r.inverse());
     } else {
       // gravity_align OFF: internal pose is in the OPTICAL camera_init frame; apply the optical->ROS
       // conjugation the fallback uses, anchored to the vrpn world pose. Without the flip vertical motion
       // leaks horizontal; without the inverse the attitude keeps a ~90deg offset.
-      tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);
       T_odom_camera_init.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
                                                odom_to_camera_init.translation.y,
                                                odom_to_camera_init.translation.z));

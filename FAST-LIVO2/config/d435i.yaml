@@ -95,7 +95,7 @@ local_map:
 
 uav:
   imu_rate_odom: false
-  gravity_align_en: false
+  gravity_align_en: true   # 2026-06-22: improves takeoff climb scale 0.74->0.93 (accel constrains vertical); gt_odom mapping handled (LIVMapper)
 
 publish:
   dense_map_en: true
