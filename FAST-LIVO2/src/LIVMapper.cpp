@@ -90,6 +90,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
+  nh.param<bool>("common/imu_only_mode", imu_only_mode, false);   // skip LIO/VIO update -> publish pure IMU-propagated state (real fast-livo IMU-only dead-reckoning; needs lidar_en=1 to drive the loop + IMU init)
+  nh.param<bool>("debug/fusion_log", fusion_debug, false);        // debug-only: log per-frame IMU-prop vs post-LIO/VIO attitude to /tmp/fusion_debug.csv
+  nh.param<bool>("debug/vio_flip_roll", vio_flip_roll, false);    // debug-only: negate the VIO roll state update
+  nh.param<bool>("debug/vio_flip_pitch", vio_flip_pitch, false);  // debug-only: negate the VIO pitch state update
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
   nh.param<bool>("common/online_intrinsics_en", online_intrinsics_en, false);
   nh.param<string>("common/cam_info_topic", cam_info_topic, "");
@@ -145,6 +149,22 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/Rcl", cameraextrinR, vector<double>());
+  nh.param<bool>("body_calib/enable", body_calib_en, false);
+  nh.param<double>("body_calib/gt_avg_sec", gt_avg_sec, 3.0);
+  {
+    vector<double> qcb, tcb;
+    nh.param<vector<double>>("body_calib/q_cam2body_xyzw", qcb, vector<double>());
+    nh.param<vector<double>>("body_calib/t_cam2body", tcb, vector<double>());
+    if (body_calib_en && qcb.size() == 4 && tcb.size() == 3) {
+      Eigen::Quaterniond q(qcb[3], qcb[0], qcb[1], qcb[2]); q.normalize();
+      R_cam2body = q.toRotationMatrix();
+      t_cam2body << tcb[0], tcb[1], tcb[2];
+      ROS_INFO("[body_calib] enabled: t_cam2body=[%.4f %.4f %.4f] m", tcb[0], tcb[1], tcb[2]);
+    } else if (body_calib_en) {
+      ROS_WARN("[body_calib] enable=true but q/t params missing/wrong size -> DISABLED");
+      body_calib_en = false;
+    }
+  }
   nh.param<double>("debug/plot_time", plot_time, -10);
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
   nh.param<bool>("debug/verbose", verbose, false);   // per-frame VIO/LIO console spam on/off (set in launch, no rebuild)
@@ -205,6 +225,8 @@ void LIVMapper::initializeComponents()
     throw std::runtime_error("Camera model not correctly specified (no CameraInfo, no usable calib file).");
 
   vio_manager->verbose = verbose;
+  vio_manager->flip_roll = vio_flip_roll;
+  vio_manager->flip_pitch = vio_flip_pitch;
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
   vio_manager->outlier_threshold = outlier_threshold;
@@ -274,12 +296,11 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   sub_imu = nh.subscribe(imu_topic, 2000, &LIVMapper::imu_cbk, this);  // [jetson] was 200000: keep ~10s of IMU (cheap to drain, avoids propagation gaps) but bounded.
   sub_img = nh.subscribe(img_topic, 10, &LIVMapper::img_cbk, this);  // [jetson] was 200000: small queue, drop stale frames under load.
   sub_reinit = nh.subscribe("/livo/reinit", 1, &LIVMapper::reinit_cbk, this);  // re-anchor trigger
-  // Always subscribe (like sim `ml`): the first pose that arrives latches
-  // odom->camera_init (gt_odom_cbk). If mocap never publishes, the hardcoded fallback
-  // in publish_odometry_odom is used. Self-selects at runtime — no enable flag.
+  // Always subscribe (like sim `ml`): the first pose that arrives latches odom->camera_init
+  // (gt_odom_cbk), used by the imu_prop odom path; body_calib also buffers GT here to anchor
+  // /aft_mapped_to_optitrack. Self-selects at runtime — no enable flag.
   sub_gt_odom = nh.subscribe(gt_pose_topic, 1, &LIVMapper::gt_odom_cbk, this);
-  ROS_INFO("[mocap] gt-init armed: first pose on %s sets odom->camera_init (else hardcoded fallback)",
-           gt_pose_topic.c_str());
+  ROS_INFO("[mocap] gt-init armed: first pose on %s sets odom->camera_init", gt_pose_topic.c_str());
 
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -287,14 +308,16 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100);
   pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100);
   pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 10);
-  pubOdomAftMappedOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_odom", 10);
+  // /aft_mapped_to_odom is GONE -> renamed /aft_mapped_to_optitrack (GT-anchored body in OptiTrack frame).
+  // /aft_mapped_to_body = the W_L body pose (PoseStamped) the estimator mux selects as the vio source.
+  pubOdomAftMappedOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_optitrack", 10);
+  pubOdomAftMappedBody = nh.advertise<geometry_msgs::PoseStamped>("/aft_mapped_to_body", 10);
   pubPath = nh.advertise<nav_msgs::Path>("/path", 10);
   plane_pub = nh.advertise<visualization_msgs::Marker>("/planner_normal", 1);
   voxel_pub = nh.advertise<visualization_msgs::MarkerArray>("/voxels", 1);
   pubLaserCloudDyn = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj", 100);
   pubLaserCloudDynRmed = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_removed", 100);
   pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
-  mavros_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
@@ -389,6 +412,15 @@ void LIVMapper::handleVIO()
 
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
+  if (fusion_debug) {  // debug-only: log post-VIO internal quaternion (mapped to world offline) vs GT
+    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw\n"); }
+    Eigen::Quaterniond qp(state_propagat.rot_end), qo(_state.rot_end), qr(vio_manager->raw_rot_vio_);
+    fprintf(dbg_fp, "%.4f,VIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f\n",
+            LidarMeasures.last_lio_update_time - _first_lidar_time, qp.x(), qp.y(), qp.z(), qp.w(), qo.x(), qo.y(), qo.z(), qo.w(),
+            vio_manager->total_points, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w());
+    fflush(dbg_fp);
+  }
+
   if (imu_prop_enable) 
   {
     ekf_finish_once = true;
@@ -397,17 +429,17 @@ void LIVMapper::handleVIO()
     state_update_flg = true;
   }
 
-  // int size_sub_map = vio_manager->visual_sub_map_cur.size();
-  // visual_sub_map->reserve(size_sub_map);
-  // for (int i = 0; i < size_sub_map; i++) 
-  // {
-  //   PointType temp_map;
-  //   temp_map.x = vio_manager->visual_sub_map_cur[i]->pos_[0];
-  //   temp_map.y = vio_manager->visual_sub_map_cur[i]->pos_[1];
-  //   temp_map.z = vio_manager->visual_sub_map_cur[i]->pos_[2];
-  //   temp_map.intensity = 0.;
-  //   visual_sub_map->push_back(temp_map);
-  // }
+  // monitor: fill /cloud_visual_sub_map_before from the ACTIVE visual_submap (upstream fill was disabled)
+  visual_sub_map->clear();
+  if (vio_manager->visual_submap != nullptr)
+    for (VisualPoint *vp : vio_manager->visual_submap->voxel_points)
+    {
+      if (vp == nullptr) continue;
+      PointType temp_map;
+      temp_map.x = vp->pos_[0]; temp_map.y = vp->pos_[1]; temp_map.z = vp->pos_[2]; temp_map.intensity = 0.;
+      visual_sub_map->push_back(temp_map);
+    }
+  publish_visual_sub_map(pubSubVisualMap);
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
@@ -425,7 +457,17 @@ void LIVMapper::handleLIO()
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << endl;
            
-  if (feats_undistort->empty() || (feats_undistort == nullptr)) 
+  if (imu_only_mode)  // real IMU-only: _state here is already the IMU-propagated state (Process2); publish it, skip LIO update + map
+  {
+    if (imu_prop_enable) { ekf_finish_once = true; latest_ekf_state = _state; latest_ekf_time = LidarMeasures.last_lio_update_time; state_update_flg = true; }
+    euler_cur = RotMtoEuler(_state.rot_end);
+    geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
+    publish_odometry(pubOdomAftMapped);
+    publish_body_optitrack();
+    return;
+  }
+
+  if (feats_undistort->empty() || (feats_undistort == nullptr))
   {
     std::cout << "[ LIO ]: No point!!!" << std::endl;
     return;
@@ -455,6 +497,15 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+
+  if (fusion_debug) {  // debug-only: log post-LIO internal quaternion (mapped to world offline) vs GT
+    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw\n"); }
+    Eigen::Quaterniond qp(state_propagat.rot_end), qo(_state.rot_end), qr(voxelmap_manager->raw_rot_lio_);
+    fprintf(dbg_fp, "%.4f,LIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f\n",
+            LidarMeasures.last_lio_update_time - _first_lidar_time, qp.x(), qp.y(), qp.z(), qp.w(), qo.x(), qo.y(), qo.z(), qo.w(),
+            voxelmap_manager->effct_feat_num_, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w());
+    fflush(dbg_fp);
+  }
 
   double t2 = omp_get_wtime();
 
@@ -492,7 +543,7 @@ void LIVMapper::handleLIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
   publish_odometry(pubOdomAftMapped);
-  publish_odometry_odom(pubOdomAftMappedOdom);
+  publish_body_optitrack();
 
   double t3 = omp_get_wtime();
 
@@ -532,7 +583,8 @@ void LIVMapper::handleLIO()
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
-  publish_mavros(mavros_pose_publisher);
+  // The estimator mux (vision_pose_mux.launch) is the SOLE publisher of /mavros/vision_pose/pose; it
+  // selects /aft_mapped_to_body (vio) or the VRPN pose (mocap). fast-livo never writes that topic itself.
 
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
@@ -1355,7 +1407,6 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap)
 {
   PointCloudXYZI::Ptr laserCloudFullRes(visual_sub_map);
-  int size = laserCloudFullRes->points.size(); if (size == 0) return;
   PointCloudXYZI::Ptr sub_pcl_visual_map_pub(new PointCloudXYZI());
   *sub_pcl_visual_map_pub = *laserCloudFullRes;
   if (1)
@@ -1416,110 +1467,99 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
   pubOdomAftMapped.publish(odomAftMapped);
 }
 
-void LIVMapper::publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom)
+// Hand-eye body publishing (body_calib path). Composes the published IMU pose with the FACTORY
+// camera<->IMU extrinsic (vio_manager->Rci/Pci) and the calibrated camera->body extrinsic (config
+// body_calib) to recover the body(=marker) pose. Two outputs:
+//   /aft_mapped_to_body       PoseStamped, body in LIVO world W_L. Always (no GT needed). MUX vio input.
+//   /aft_mapped_to_optitrack  Odometry, body in OptiTrack global. Needs GT; anchored once from a
+//                             gt_avg_sec average so any deviation from /vision_pose/mocap is pure drift.
+void LIVMapper::publish_body_optitrack()
 {
-  // Transform the camera_init-frame body pose into odom and publish /aft_mapped_to_odom.
-  //   odom_body = T_odom_camera_init * T_camera_init_body
-  // Two sources for T_odom_camera_init:
-  //   gt_odom_received -> latched mocap pose (gt_odom_cbk); body orientation used as-is
-  //                       (the latch carries the full odom<-camera_init relation). The TF
-  //                       is broadcast here so rviz (Fixed Frame=odom) connects the tree.
-  //   else             -> hardcoded optical-axis flip Q(0.5,-0.5,0.5,-0.5), zero translation
-  //                       (camera_init optical Z/X/Y -> ROS X/Y/Z); the odom->camera_init TF
-  //                       then comes from the launch static_transform_publisher.
-  tf::Transform T_odom_camera_init, T_camera_init_body;
-  T_camera_init_body.setOrigin(tf::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
+  // H_{world<-body} = T_WI * inv(T_CI) * inv(T_BC)
+  Eigen::Isometry3d T_WI = Eigen::Isometry3d::Identity();
+  T_WI.linear() = _state.rot_end;  T_WI.translation() = _state.pos_end;            // IMU in world
+  Eigen::Isometry3d T_CI = Eigen::Isometry3d::Identity();
+  T_CI.linear() = vio_manager->Rci; T_CI.translation() = vio_manager->Pci;          // p_cam = Rci p_imu + Pci
+  Eigen::Isometry3d T_BC = Eigen::Isometry3d::Identity();
+  T_BC.linear() = R_cam2body;      T_BC.translation() = t_cam2body;                 // p_body = R p_cam + t
+  Eigen::Isometry3d T_WB = T_WI * T_CI.inverse() * T_BC.inverse();
 
-  if (gt_odom_received) {
-    tf::Quaternion q_vrpn(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
-                          odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
-    tf::Quaternion q_body(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
-    tf::Quaternion q_o2r(0.5, -0.5, 0.5, -0.5);   // optical->ROS flip (the hand-eye both paths need)
-    if (gravity_align_en) {
-      // gravity_align ON: gravityAlignment() left the internal frame at G_R_I0*optical (z-up); measured
-      // geoQuat_init has roll ~-90deg. The OFF path's body rotation is still geoQuat*q_o2r^-1, but the
-      // anchor must additionally undo G_R_I0: deriving T_odom_body = T_odom_ci*T_ci_body with
-      // pos_end_opt = inv(G_R_I0)*pos_end_grav gives anchor rot = q_vrpn * q_o2r * inv(geoQuat_init).
-      // (OFF is the geoQuat_init=identity special case.) Latched once after gravity alignment finishes.
-      if (!grav_anchor_latched && gravity_align_finished) {
-        tf::Quaternion qr = q_vrpn * q_o2r * q_body.inverse();   // q_body here = geoQuat_init
-        tf::Vector3 pe(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2));
-        tf::Vector3 t_anchor(odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
-                             odom_to_camera_init.translation.z);
-        t_anchor -= tf::quatRotate(qr, pe);   // so published(latch) == vrpn even if pos_end drifted from 0
-        ROS_INFO("[mocap] grav anchor latched (|pos_end|=%.3f m)", pe.length());
-        odom_to_camera_init_grav.translation.x = t_anchor.x();
-        odom_to_camera_init_grav.translation.y = t_anchor.y();
-        odom_to_camera_init_grav.translation.z = t_anchor.z();
-        odom_to_camera_init_grav.rotation.x = qr.x(); odom_to_camera_init_grav.rotation.y = qr.y();
-        odom_to_camera_init_grav.rotation.z = qr.z(); odom_to_camera_init_grav.rotation.w = qr.w();
-        grav_anchor_latched = true;
-      }
-      const geometry_msgs::Transform &A = grav_anchor_latched ? odom_to_camera_init_grav : odom_to_camera_init;
-      T_odom_camera_init.setOrigin(tf::Vector3(A.translation.x, A.translation.y, A.translation.z));
-      T_odom_camera_init.setRotation(tf::Quaternion(A.rotation.x, A.rotation.y, A.rotation.z, A.rotation.w));
-      T_camera_init_body.setRotation(q_body * q_o2r.inverse());
-    } else {
-      // gravity_align OFF: internal pose is in the OPTICAL camera_init frame; apply the optical->ROS
-      // conjugation the fallback uses, anchored to the vrpn world pose. Without the flip vertical motion
-      // leaks horizontal; without the inverse the attitude keeps a ~90deg offset.
-      T_odom_camera_init.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
-                                               odom_to_camera_init.translation.y,
-                                               odom_to_camera_init.translation.z));
-      T_odom_camera_init.setRotation(q_vrpn * q_o2r);
-      T_camera_init_body.setRotation(q_body * q_o2r.inverse());
-    }
-  } else {
-    T_odom_camera_init.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
-    T_odom_camera_init.setRotation(tf::Quaternion(0.5, -0.5, 0.5, -0.5));
-    tf::Quaternion q_camera_init_to_odom = T_odom_camera_init.getRotation().inverse();
-    tf::Quaternion rot_camera_init(geoQuat.x, geoQuat.y, geoQuat.z, geoQuat.w);
-    T_camera_init_body.setRotation(rot_camera_init * q_camera_init_to_odom);
+  ros::Time now = ros::Time::now();
+  {
+    Eigen::Quaterniond q(T_WB.linear());
+    geometry_msgs::PoseStamped pb;
+    pb.header.stamp = now; pb.header.frame_id = "odom";   // unify with control-facing fast_livo topics (imu_propagate)
+    pb.pose.position.x = T_WB.translation().x();
+    pb.pose.position.y = T_WB.translation().y();
+    pb.pose.position.z = T_WB.translation().z();
+    pb.pose.orientation.x = q.x(); pb.pose.orientation.y = q.y();
+    pb.pose.orientation.z = q.z(); pb.pose.orientation.w = q.w();
+    pubOdomAftMappedBody.publish(pb);
   }
 
-  // LIVMapper OWNS the odom->camera_init edge in BOTH cases (gt-latched pose, or the
-  // hardcoded flip as fallback). Because it is always published here, the launch no
-  // longer needs a static_transform_publisher and the gt subscriber can stay always-on.
-  static tf::TransformBroadcaster br_odom;
-  br_odom.sendTransform(tf::StampedTransform(T_odom_camera_init, ros::Time::now(), "odom", "camera_init"));
+  if (gravity_align_en && !gravity_align_finished) return;   // anchor only after gravity align settles
+  if (gt_odom_received && !body_anchor_latched &&
+      gt_buf.size() >= 2 && (gt_buf.back().first - gt_buf.front().first) >= gt_avg_sec) {
+    Eigen::Vector3d t_avg = Eigen::Vector3d::Zero();
+    Eigen::Vector4d q_acc = Eigen::Vector4d::Zero();
+    Eigen::Quaterniond q0(gt_buf.front().second.linear());
+    for (auto &kv : gt_buf) {
+      t_avg += kv.second.translation();
+      Eigen::Quaterniond qi(kv.second.linear());
+      if (qi.dot(q0) < 0) qi.coeffs() *= -1.0;               // sign-align before averaging
+      q_acc += qi.coeffs();
+    }
+    t_avg /= static_cast<double>(gt_buf.size());
+    Eigen::Quaterniond q_avg; q_avg.coeffs() = q_acc.normalized();
+    Eigen::Isometry3d T_GB = Eigen::Isometry3d::Identity();
+    T_GB.linear() = q_avg.toRotationMatrix(); T_GB.translation() = t_avg;
+    T_anchor = T_GB * T_WB.inverse();                        // optitrack <- W_L, constant
+    body_anchor_latched = true;
+    ROS_INFO("[body_calib] optitrack anchor latched from %.1fs GT avg (%zu samples)", gt_avg_sec, gt_buf.size());
+  }
+  if (!body_anchor_latched) return;                          // no global frame yet -> only /aft_mapped_to_body
 
-  tf::Transform T_odom_body = T_odom_camera_init * T_camera_init_body;
-  tf::Vector3 pos_in_odom = T_odom_body.getOrigin();
-  tf::Quaternion rot_in_odom = T_odom_body.getRotation();
-
-  nav_msgs::Odometry odomInOdom;
-  odomInOdom.header.frame_id = "odom";
-  odomInOdom.child_frame_id = "camera_link";
-  odomInOdom.header.stamp = ros::Time::now();
-
-  odomInOdom.pose.pose.position.x = pos_in_odom.x();
-  odomInOdom.pose.pose.position.y = pos_in_odom.y();
-  odomInOdom.pose.pose.position.z = pos_in_odom.z();
-
-  odomInOdom.pose.pose.orientation.x = rot_in_odom.x();
-  odomInOdom.pose.pose.orientation.y = rot_in_odom.y();
-  odomInOdom.pose.pose.orientation.z = rot_in_odom.z();
-  odomInOdom.pose.pose.orientation.w = rot_in_odom.w();
-
-  pubOdomAftMappedOdom.publish(odomInOdom);
+  Eigen::Isometry3d T_GB = T_anchor * T_WB;
+  Eigen::Quaterniond q(T_GB.linear());
+  nav_msgs::Odometry od;
+  od.header.stamp = now; od.header.frame_id = "optitrack"; od.child_frame_id = "body";
+  od.pose.pose.position.x = T_GB.translation().x();
+  od.pose.pose.position.y = T_GB.translation().y();
+  od.pose.pose.position.z = T_GB.translation().z();
+  od.pose.pose.orientation.x = q.x(); od.pose.pose.orientation.y = q.y();
+  od.pose.pose.orientation.z = q.z(); od.pose.pose.orientation.w = q.w();
+  pubOdomAftMappedOdom.publish(od);
 }
 
 // Mocap gt-init (ported from sim `ml`): the FIRST pose on gt_pose_topic defines
 // odom -> camera_init. The internal EKF state is NOT changed — it stays at the
 // camera_init origin (so /aft_mapped_to_init is still 0,0,0 at boot); instead the
-// odom-frame publishers (publish_odometry_odom, imu_prop_callback) multiply by this
-// latched transform so their output starts at the true mocap pose.
+// imu_prop odom publisher multiplies by this latched transform so its output starts
+// at the true mocap pose.
 void LIVMapper::gt_odom_cbk(const geometry_msgs::PoseStamped::ConstPtr &msg_in)
 {
-  if (gt_odom_received) return;  // first message only
-  odom_to_camera_init.translation.x = msg_in->pose.position.x;
-  odom_to_camera_init.translation.y = msg_in->pose.position.y;
-  odom_to_camera_init.translation.z = msg_in->pose.position.z;
-  odom_to_camera_init.rotation = msg_in->pose.orientation;
-  gt_odom_received = true;
-  ROS_INFO("[mocap] latched odom->camera_init from gt pose [%.3f, %.3f, %.3f]",
-           odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
-           odom_to_camera_init.translation.z);
+  // Legacy first-message latch (kept for the imu_prop odom path / non-body fallback).
+  if (!gt_odom_received) {
+    odom_to_camera_init.translation.x = msg_in->pose.position.x;
+    odom_to_camera_init.translation.y = msg_in->pose.position.y;
+    odom_to_camera_init.translation.z = msg_in->pose.position.z;
+    odom_to_camera_init.rotation = msg_in->pose.orientation;
+    gt_odom_received = true;
+    ROS_INFO("[mocap] latched odom->camera_init from gt pose [%.3f, %.3f, %.3f]",
+             odom_to_camera_init.translation.x, odom_to_camera_init.translation.y,
+             odom_to_camera_init.translation.z);
+  }
+  // body_calib anchor: buffer GT (optitrack<-body) poses until latched, for a gt_avg_sec average
+  // (single t=0 sample is ~1deg noisy -> cm-level constant offset over the whole trajectory).
+  if (body_calib_en && !body_anchor_latched) {
+    const auto &o = msg_in->pose.orientation; const auto &p = msg_in->pose.position;
+    Eigen::Isometry3d g = Eigen::Isometry3d::Identity();
+    g.linear() = Eigen::Quaterniond(o.w, o.x, o.y, o.z).normalized().toRotationMatrix();
+    g.translation() = Eigen::Vector3d(p.x, p.y, p.z);
+    gt_buf.emplace_back(msg_in->header.stamp.toSec(), g);
+    while (gt_buf.size() > 2 && gt_buf.back().first - gt_buf.front().first > gt_avg_sec + 1.0)
+      gt_buf.erase(gt_buf.begin());
+  }
 }
 
 // Re-anchor on demand: reset LIVO state and re-latch on the next gt pose. Trigger with
@@ -1530,7 +1570,8 @@ void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
 {
   ROS_WARN("[mocap] reinit requested: resetting LIVO state, re-latch on next gt pose");
   gt_odom_received = false;
-  grav_anchor_latched = false;
+  body_anchor_latched = false;
+  gt_buf.clear();
   p_imu->Reset();
   _state.resetpose();
   vio_manager->resetGrid();
@@ -1538,14 +1579,6 @@ void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
   lidar_map_inited = false;
   ekf_finish_once = false;
   is_first_frame = true;
-}
-
-void LIVMapper::publish_mavros(const ros::Publisher &mavros_pose_publisher)
-{
-  msg_body_pose.header.stamp = ros::Time::now();
-  msg_body_pose.header.frame_id = "camera_init";
-  set_posestamp(msg_body_pose.pose);
-  mavros_pose_publisher.publish(msg_body_pose);
 }
 
 void LIVMapper::publish_path(const ros::Publisher pubPath)

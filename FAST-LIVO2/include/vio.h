@@ -119,6 +119,8 @@ public:
   int frame_count = 0;
   bool plot_flag;
   bool verbose = false;   // gate per-frame VIO console spam (injected from LIVMapper debug/verbose)
+  bool flip_roll = false, flip_pitch = false;   // debug: negate VIO roll/pitch update component (test sign hypothesis)
+  M3D raw_rot_vio_ = M3D::Identity();   // debug: raw prior-free GN measurement-implied rotation (iter0), for fusion_log
 
   Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;

@@ -42,6 +42,7 @@ typedef struct VoxelMapConfig
   double planner_threshold_;
   double beam_err_;
   double dept_err_;
+  double dept_err_rel_;
   double sigma_num_;
   bool is_pub_plane_map_;
 
@@ -124,7 +125,7 @@ struct DS_POINT
   int count = 0;
 };
 
-void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov);
+void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov, const float range_rel = 0.0f);
 
 class VoxelOctoTree
 {
@@ -213,6 +214,7 @@ public:
 
   int feats_down_size_;
   int effct_feat_num_;
+  M3D raw_rot_lio_ = M3D::Identity();   // debug: raw prior-free GN measurement-implied rotation (iter0), for fusion_log
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;

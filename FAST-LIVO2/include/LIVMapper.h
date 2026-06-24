@@ -62,8 +62,7 @@ public:
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
-  void publish_odometry_odom(const ros::Publisher &pubOdomAftMappedOdom);  // Publish in odom frame
-  void publish_mavros(const ros::Publisher &mavros_pose_publisher);
+  void publish_body_optitrack();  // /aft_mapped_to_body (+ /aft_mapped_to_optitrack) via hand-eye T_cam2body
   void publish_path(const ros::Publisher pubPath);
   void readParameters(ros::NodeHandle &nh);
   template <typename T> void set_posestamp(T &out);
@@ -87,6 +86,16 @@ public:
   double cam_info_timeout = 5.0;
   V3D extT;
   M3D extR;
+
+  // Body(=marker) hand-eye extrinsic. /aft_mapped_to_body (PoseStamped, W_L frame, mux vio input)
+  // + /aft_mapped_to_optitrack (Odometry, GT-anchored). T_cam2body (p_body=R*p_cam+t) from config body_calib.
+  bool body_calib_en = false;
+  M3D R_cam2body = M3D::Identity();
+  V3D t_cam2body = V3D::Zero();
+  double gt_avg_sec = 3.0;
+  bool body_anchor_latched = false;
+  Eigen::Isometry3d T_anchor = Eigen::Isometry3d::Identity();   // optitrack <- W_L, latched once
+  std::vector<std::pair<double, Eigen::Isometry3d>> gt_buf;     // recent GT (optitrack<-body) for the anchor avg
 
   int feats_down_size = 0, max_iterations = 0;
 
@@ -114,7 +123,8 @@ public:
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
 
-  bool gravity_align_en = false, gravity_align_finished = false;
+  bool gravity_align_en = false, gravity_align_finished = false, imu_only_mode = false, fusion_debug = false, vio_flip_roll = false, vio_flip_pitch = false;
+  FILE *dbg_fp = nullptr;   // debug-only per-frame fusion/preintegration log (debug/fusion_log)
 
   bool sync_jump_flag = false;
 
@@ -183,14 +193,10 @@ public:
   ros::Subscriber sub_gt_odom;   // mocap pose -> gt_odom_cbk (always subscribed; self-selects)
   ros::Subscriber sub_reinit;    // /livo/reinit -> reinit_cbk
   // mocap gt-init state. odom_to_camera_init holds the latched odom<-camera_init pose;
-  // when gt_odom_received, the odom-frame publishers multiply by it (see publish_odometry_odom).
+  // the imu_prop odom path multiplies by it (gt_odom_cbk latches it from the first VRPN pose).
   bool gt_odom_received = false;
   std::string gt_pose_topic;
   geometry_msgs::Transform odom_to_camera_init;
-  // gravity_align=on path: z-up internal frame needs odom<-camera_init = vrpn_init * inv(body_at_init),
-  // latched once at first publish (no fixed optical flip). See publish_odometry_odom.
-  bool grav_anchor_latched = false;
-  geometry_msgs::Transform odom_to_camera_init_grav;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;
@@ -198,12 +204,12 @@ public:
   ros::Publisher pubLaserCloudMap;
   ros::Publisher pubOdomAftMapped;
   ros::Publisher pubOdomAftMappedOdom;  // Odometry in odom frame
+  ros::Publisher pubOdomAftMappedBody;  // /aft_mapped_to_body (PoseStamped, W_L, mux vio input)
   ros::Publisher pubPath;
   ros::Publisher pubLaserCloudDyn;
   ros::Publisher pubLaserCloudDynRmed;
   ros::Publisher pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
-  ros::Publisher mavros_pose_publisher;
   ros::Timer imu_prop_timer;
 
   int frame_num = 0;

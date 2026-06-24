@@ -17,7 +17,7 @@ common:
   cam_info_timeout: 5.0
 
 # ===========================================================================
-# Intel RealSense D435i  (serial 109622074087) on Jetson Orin AGX
+# Intel RealSense D435i  (serial 923322070596) on Jetson Orin AGX
 # Use with camera_d435i.yaml (intrinsics @640x480, captured 2026-06-01).
 #
 # HARDWARE NOTE: when captured, the camera was behind the Orin's onboard
@@ -29,21 +29,30 @@ common:
 # ===========================================================================
 
 extrin_calib:
-  # IMU to LiDAR extrinsic (identity for initial test - needs IMU-camera calibration)
-  extrinsic_T: [0.00552, -0.0051, -0.01174]   # real IMU->depth lever arm (from /tf_static; was identity)
+  # IMU<-Depth (Lid_offset_to_IMU). VERIFIED 2026-06-22 against rs-enumerate-devices -c
+  # on S/N 923322070596: == -(Depth->Gyro/Accel = [-0.00552,0.0051,0.01174]) to full
+  # precision, rotation identity. Factory model-constant lever arm.
+  extrinsic_T: [0.00552, -0.0051, -0.01174]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  # Depth (LiDAR) to Color (Camera) extrinsic.
-  # Captured /camera/extrinsics/depth_to_color (D435i, 2026-06-01):
-  #   rotation R    = [0.99998868, 0.00475298, 0.00032512,
-  #                   -0.00475199, 0.99998426, -0.00298469,
-  #                   -0.00033930, 0.00298312, 0.99999547]
-  #   translation t = [0.01471226, -2.753e-07, 0.00040132]   (baseline 14.7mm)
-  # FAST-LIVO uses the INVERSE (color->depth), same convention as d455.yaml:
-  #   Rcl = R^T,  Pcl = -R^T*t
-  Rcl: [0.99998868, -0.00475199, -0.00033930,
-        0.00475298,  0.99998426,  0.00298312,
-        0.00032512, -0.00298469,  0.99999547]
-  Pcl: [-0.01471204, -0.00007089, -0.00040610]
+  # Color->Depth (Rcl/Pcl). From rs-enumerate-devices -c "Color To Depth" on
+  # S/N 923322070596 (2026-06-22). The inverse (Depth->Color) was
+  #   R = [0.999978, 0.00659742, 0.00021399, -0.00659736, 0.999978, -0.000301692,
+  #        -0.000215976, 0.000300274, 1],  t = [0.01438551, 9.43e-05, 0.00042120]
+  #   (baseline 14.4mm). Rcl/Pcl below ARE that "Color To Depth" block verbatim.
+  Rcl: [0.999978,   -0.00659736, -0.000215976,
+        0.00659742,  0.999978,    0.000300274,
+        0.00021399, -0.000301692, 1.0]
+  Pcl: [-0.0143844867125154, -0.000189328260603361, -0.000424247875344008]
+
+# Body(=marker) hand-eye extrinsic for /aft_mapped_to_body (mux vio input) + /aft_mapped_to_optitrack.
+# T_cam2body: p_body = R*p_cam + t  (OpenCV cam2gripper; gripper = OptiTrack 'pure' rigid body rigidly
+# attached AT the vehicle body). 2026-06-24 ChArUco stop-and-go, 32 inliers, residual 6.9mm/0.64deg.
+# Source: tools/fastlivo/_handeye_clean.yaml. Rotation independent of board scale; translation in meters.
+body_calib:
+  enable: true
+  q_cam2body_xyzw: [0.4947, -0.5015, 0.5079, -0.4957]
+  t_cam2body: [0.07685, 0.02273, 0.03045]
+  gt_avg_sec: 3.0          # average GT over this many sec (startup still window) to latch the optitrack anchor
 
 time_offset:
   imu_time_offset: 0.0
@@ -82,6 +91,7 @@ lio:
   max_iterations: 5
   dept_err: 0.02
   beam_err: 0.05
+  dept_err_rel: 0.0       # 0=off (Livox-style flat depth cov). >0 adds range-proportional depth noise for D435i stereo: range_var += (dept_err_rel*range)^2
   min_eigen_value: 0.0025
   voxel_size: 0.5
   max_layer: 2

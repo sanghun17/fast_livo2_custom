@@ -12,11 +12,11 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
-void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
+void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov, const float range_rel)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
   float range = sqrt(pb[0] * pb[0] + pb[1] * pb[1] + pb[2] * pb[2]);
-  float range_var = range_inc * range_inc;
+  float range_var = range_inc * range_inc + range_rel * range_rel * range * range;  // range_rel (lio/dept_err_rel): range-proportional depth noise; D435i stereo error grows ~%·range, Livox dept_err is flat. rel=0 -> original
   Eigen::Matrix2d direction_var;
   direction_var << pow(sin(DEG2RAD(degree_inc)), 2), 0, 0, pow(sin(DEG2RAD(degree_inc)), 2);
   Eigen::Vector3d direction(pb);
@@ -43,6 +43,7 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("lio/sigma_num", voxel_config.sigma_num_, 3);
   nh.param<double>("lio/beam_err", voxel_config.beam_err_, 0.02);
   nh.param<double>("lio/dept_err", voxel_config.dept_err_, 0.05);
+  nh.param<double>("lio/dept_err_rel", voxel_config.dept_err_rel_, 0.0);
   nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
   nh.param<int>("lio/max_points_num", voxel_config.max_points_num_, 50);
   nh.param<int>("lio/max_iterations", voxel_config.max_iterations_, 5);
@@ -351,7 +352,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     if (point_this[2] == 0) { point_this[2] = 0.001; }
     M3D var;
-    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var, config_setting_.dept_err_rel_);
     body_cov_list_.push_back(var);
     point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
@@ -471,6 +472,11 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    if (iterCount == 0) {  // debug: raw prior-free GN solution (what the LiDAR measurement wants before the prior), from prop
+      VD(DIM_STATE) raw_sol; raw_sol.setZero();
+      raw_sol.block<6, 1>(0, 0) = (H_T_H.block<6, 6>(0, 0) + MD(6, 6)::Identity()).inverse() * HTz;
+      StatesGroup tmp = state_; tmp += raw_sol; raw_rot_lio_ = tmp.rot_end;
+    }
     int minRow, minCol;
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);
@@ -546,7 +552,7 @@ void VoxelMapManager::BuildVoxelMap()
     pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     M3D var;
-    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var, config_setting_.dept_err_rel_);
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +

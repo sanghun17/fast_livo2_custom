@@ -3,8 +3,9 @@ cam_width: 640
 cam_height: 480
 scale: 1.0
 # ---------------------------------------------------------------------------
-# Intel RealSense D435i  (serial 109622074087)
-# Captured 2026-06-01 from /camera/color/camera_info @ 640x480 on Jetson Orin AGX.
+# Intel RealSense D435i  (serial 923322070596)
+# Captured 2026-06-22 from rs-enumerate-devices -c ("Color" 640x480) on Jetson Orin AGX.
+# (Replaced 2026-06-01 values that belonged to a different unit, S/N 109622074087.)
 # K: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
 #   The D435i color stream reports a rectified (plumb_bob) model with ZERO
 #   distortion → cam_d0..d3 are all 0.0. (D455 by contrast reports small Brown
@@ -14,10 +15,10 @@ scale: 1.0
 #   port (see jetson-port-spec.md §camera) and run at 1280x720, RE-CAPTURE:
 #     rostopic echo -n1 /camera/color/camera_info
 # ---------------------------------------------------------------------------
-cam_fx: 605.55712890625
-cam_fy: 605.573974609375
-cam_cx: 324.37408447265625
-cam_cy: 237.1529083251953
+cam_fx: 609.452575683594
+cam_fy: 609.437255859375
+cam_cx: 327.809936523438
+cam_cy: 250.661087036133
 # Distortion coefficients (k1, k2, p1, p2) from D array  D: [k1, k2, p1, p2, k3]
 cam_d0: 0.0
 cam_d1: 0.0

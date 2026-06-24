@@ -1666,6 +1666,17 @@ void VIOManager::updateState(cv::Mat img, int level)
       MD(DIM_STATE, 1)
       solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec - G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
 
+      if (iteration == 0) {  // debug: raw prior-free GN solution (what the camera measurement wants before the prior), from VIO entry
+        VD(DIM_STATE) raw_sol; raw_sol.setZero();
+        raw_sol.block<7, 1>(0, 0) = (H_T_H.block<7, 7>(0, 0) + MD(7, 7)::Identity()).inverse() * HTz;
+        StatesGroup tmp = (*state); tmp += raw_sol; raw_rot_vio_ = tmp.rot_end;
+      }
+      if (flip_roll || flip_pitch) {  // debug: flip VIO roll/pitch update in the WORLD frame (clean axis separation)
+        V3D dw = state->rot_end * solution.block<3, 1>(0, 0);          // body-frame rot update -> world
+        if (flip_roll) dw(0) = -dw(0);
+        if (flip_pitch) dw(1) = -dw(1);
+        solution.block<3, 1>(0, 0) = state->rot_end.transpose() * dw;  // world -> back to body
+      }
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);
       auto &&t_add = solution.block<3, 1>(3, 0);
