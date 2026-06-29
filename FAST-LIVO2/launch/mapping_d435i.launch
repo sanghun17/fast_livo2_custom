@@ -16,7 +16,7 @@
      self-selects at runtime: the FIRST OptiTrack pose latches the transform to the
      testbed-centre origin (gt_odom_cbk); if mocap never publishes it falls back to the
      hardcoded optical-axis flip (camera_init optical Z/X/Y -> ROS X/Y/Z, zero translation).
-     With mocap up, /aft_mapped_to_odom + /LIVO2/imu_propagate START at the true mocap pose
+     With mocap up, /aft_mapped_to_optitrack + /aft_mapped_to_body_imu_propagated START at the true mocap pose
      and then follow LIVO. (/aft_mapped_to_init stays in camera_init, 0,0,0 at boot, BY
      DESIGN — internal estimate.) Re-anchor: rostopic pub -1 /livo/reinit std_msgs/Empty {} -->
 <param name="mocap/gt_pose_topic" value="/vrpn_client_node/pure/pose"/>

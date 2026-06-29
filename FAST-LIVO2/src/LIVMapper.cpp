@@ -319,7 +319,7 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudDynRmed = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_removed", 100);
   pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
   pubImage = it.advertise("/rgb_img", 1);
-  pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
+  pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_body_imu_propagated", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
 }
@@ -759,17 +759,49 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
     vel_i = imu_propagate.vel_end;
     q = Eigen::Quaterniond(imu_propagate.rot_end);
     imu_prop_odom.header.stamp = newest_imu.header.stamp;
-    tf::Quaternion q_otc;  // odom<-camera_init rotation; used by both pose and twist below
-    if (gt_odom_received) {
-      // Mocap gt-init: transform the camera_init-frame propagated pose into odom,
-      // so /LIVO2/imu_propagate starts at the true mocap pose (matches the sim `ml`
-      // branch). odom_pose = odom_to_camera_init * camera_init_pose.
+    imu_prop_odom.child_frame_id = "base_link";
+    if (body_calib_en && vio_manager) {
+      // Publish the BODY(marker) pose, not the raw IMU, so /aft_mapped_to_body_imu_propagated matches
+      // /aft_mapped_to_body. The planner reads YAW from this odom (state_manager.py); the
+      // raw IMU optical frame gives a ~90deg-wrong heading and disagrees with the EKF2/
+      // control body frame. Same hand-eye chain as publish_body_optitrack, plus twist, at
+      // IMU rate. World bridge: optitrack anchor when latched (global == /aft_mapped_to_optitrack),
+      // else the q_o2r optical->ROS flip (VIO-local == /aft_mapped_to_body).
+      Eigen::Isometry3d T_WI = Eigen::Isometry3d::Identity();
+      T_WI.linear() = imu_propagate.rot_end;  T_WI.translation() = imu_propagate.pos_end;
+      Eigen::Isometry3d T_CI = Eigen::Isometry3d::Identity();
+      T_CI.linear() = vio_manager->Rci;  T_CI.translation() = vio_manager->Pci;
+      Eigen::Isometry3d T_BC = Eigen::Isometry3d::Identity();
+      T_BC.linear() = R_cam2body;  T_BC.translation() = t_cam2body;
+      Eigen::Isometry3d T_WB = T_WI * T_CI.inverse() * T_BC.inverse();
+
+      Eigen::Isometry3d T_bridge = Eigen::Isometry3d::Identity();
+      if (body_anchor_latched) T_bridge = T_anchor;                                       // global (optitrack)
+      else T_bridge.linear() = Eigen::Quaterniond(-0.5, 0.5, -0.5, 0.5).toRotationMatrix();// q_o2r (w,x,y,z)
+      Eigen::Isometry3d T_pub = T_bridge * T_WB;
+      Eigen::Vector3d   v_pub = T_bridge.linear() * vel_i;   // world-frame vel; marker lever-arm ignored (small)
+      Eigen::Quaterniond q_pub(T_pub.linear());
+
+      imu_prop_odom.header.frame_id = "odom";
+      imu_prop_odom.pose.pose.position.x = T_pub.translation().x();
+      imu_prop_odom.pose.pose.position.y = T_pub.translation().y();
+      imu_prop_odom.pose.pose.position.z = T_pub.translation().z();
+      imu_prop_odom.pose.pose.orientation.x = q_pub.x();
+      imu_prop_odom.pose.pose.orientation.y = q_pub.y();
+      imu_prop_odom.pose.pose.orientation.z = q_pub.z();
+      imu_prop_odom.pose.pose.orientation.w = q_pub.w();
+      imu_prop_odom.twist.twist.linear.x = v_pub.x();
+      imu_prop_odom.twist.twist.linear.y = v_pub.y();
+      imu_prop_odom.twist.twist.linear.z = v_pub.z();
+    } else if (gt_odom_received) {
+      // Legacy IMU gt-latch (body_calib off): odom_pose = odom_to_camera_init * camera_init_pose,
+      // so /aft_mapped_to_body_imu_propagated starts at the true mocap pose (matches the sim `ml` branch).
       tf::Transform odom_to_cam_init_tf;
       odom_to_cam_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
                                                 odom_to_camera_init.translation.y,
                                                 odom_to_camera_init.translation.z));
-      q_otc = tf::Quaternion(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
-                             odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
+      tf::Quaternion q_otc(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
+                           odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
       odom_to_cam_init_tf.setRotation(q_otc);
       tf::Transform cam_init_pose_tf;
       cam_init_pose_tf.setOrigin(tf::Vector3(posi.x(), posi.y(), posi.z()));
@@ -778,7 +810,6 @@ void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
       tf::Vector3 p = odom_pose_tf.getOrigin();
       tf::Quaternion qt = odom_pose_tf.getRotation();
       imu_prop_odom.header.frame_id = "odom";
-      imu_prop_odom.child_frame_id = "base_link";
       imu_prop_odom.pose.pose.position.x = p.x();
       imu_prop_odom.pose.pose.position.y = p.y();
       imu_prop_odom.pose.pose.position.z = p.z();
@@ -1485,13 +1516,22 @@ void LIVMapper::publish_body_optitrack()
   Eigen::Isometry3d T_WB = T_WI * T_CI.inverse() * T_BC.inverse();
 
   ros::Time now = ros::Time::now();
+  // /aft_mapped_to_body lives in the ROS-oriented W_L frame. T_WB is in the OPTICAL
+  // camera_init world (gravity_align off), so left-multiply the optical->ROS world flip
+  // q_o2r=(x,y,z,w)=(0.5,-0.5,0.5,-0.5) — the same bridge the old /aft_mapped_to_odom
+  // used. Without it optical +Z(forward) reads as ROS +Z and the body points up.
+  // Unanchored on purpose (W_L origin; mocap-source offset jump is intended).
+  static const Eigen::Quaterniond q_o2r(-0.5, 0.5, -0.5, 0.5);   // (w,x,y,z)
+  Eigen::Isometry3d T_ros = Eigen::Isometry3d::Identity();
+  T_ros.linear() = q_o2r.toRotationMatrix();
+  Eigen::Isometry3d T_WB_ros = T_ros * T_WB;
   {
-    Eigen::Quaterniond q(T_WB.linear());
+    Eigen::Quaterniond q(T_WB_ros.linear());
     geometry_msgs::PoseStamped pb;
     pb.header.stamp = now; pb.header.frame_id = "odom";   // unify with control-facing fast_livo topics (imu_propagate)
-    pb.pose.position.x = T_WB.translation().x();
-    pb.pose.position.y = T_WB.translation().y();
-    pb.pose.position.z = T_WB.translation().z();
+    pb.pose.position.x = T_WB_ros.translation().x();
+    pb.pose.position.y = T_WB_ros.translation().y();
+    pb.pose.position.z = T_WB_ros.translation().z();
     pb.pose.orientation.x = q.x(); pb.pose.orientation.y = q.y();
     pb.pose.orientation.z = q.z(); pb.pose.orientation.w = q.w();
     pubOdomAftMappedBody.publish(pb);

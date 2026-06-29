@@ -114,7 +114,7 @@ local_map:
   sliding_thresh: 8
 
 uav:
-  imu_rate_odom: false
+  imu_rate_odom: true   # /aft_mapped_to_body_imu_propagated (Odometry+twist, 250Hz) = planning_odom_mux vio source
   gravity_align_en: false  # TUNED (was true): grid best (ga0) = 0.093m vs ga1 0.123m on the test bag.
   # ⚠️ FLIGHT CAVEAT: gravity_align=true was set 2026-06-22 to fix takeoff climb scale (0.74->0.93,
   # accel constrains vertical). The bag-best turns it OFF, but that bag may not stress takeoff climb.
