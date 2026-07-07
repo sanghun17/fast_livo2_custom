@@ -52,17 +52,19 @@
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen"
 	      launch-prefix="taskset -c $(env CPUS_FASTLIVO) nice -n -15" />
 
-	<!-- Smart TF Bridge: Connects LIVO and RealSense TF trees -->
+	<!-- Smart TF Bridge: aft_mapped -> camera_imu_optical_frame (re-rooted onto
+	     RealSense's own camera TF tree) + aft_mapped -> base_link (plain alias,
+	     no other publisher owns that name). One node manages every bridge in
+	     this list — see smart_static_tf_bridge.py.
+	     base_link is aliased here, not via MAVROS's local_position tf.send: that's
+	     deliberately off (px4_config.yaml) so FAST-LIVO stays the single odom->body
+	     TF authority; enabling it would add a second, independently-converging
+	     odom->body tree. -->
 	<node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
-		<param name="parent" value="aft_mapped" />
-		<param name="child" value="camera_imu_optical_frame" />
-		<param name="x" value="0.0" />
-		<param name="y" value="0.0" />
-		<param name="z" value="0.0" />
-		<param name="qx" value="0.0" />
-		<param name="qy" value="0.0" />
-		<param name="qz" value="0.0" />
-		<param name="qw" value="1.0" />
+		<rosparam param="bridges">
+			- {parent: aft_mapped, child: camera_imu_optical_frame}
+			- {parent: aft_mapped, child: base_link}
+		</rosparam>
 	</node>
 
 	<!-- Divergence guard: if |pos| ever exceeds max_dist the estimate has already

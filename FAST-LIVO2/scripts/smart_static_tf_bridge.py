@@ -2,7 +2,7 @@
 """
 Smart Static TF Bridge: Intelligently connects TF trees using static transforms.
 
-Given a desired transform between two frames (e.g., leaves), this script:
+One node manages a LIST of independent (parent, child) bridges. For each:
 1. Checks if the desired transform conflicts with existing TF
 2. Finds the root of the child frame's TF tree
 3. Calculates the proper parent → root transform by multiplying intermediate transforms
@@ -13,17 +13,15 @@ Key insight:
 - Child frame must be a root (to avoid conflicts)
 - Calculate: T(parent → root) = T(parent → child_desired) × T(child_desired → root)
 
-Usage:
-    rosrun fast_livo smart_static_tf_bridge.py \
-        _parent:=aft_mapped \
-        _child:=camera_color_optical_frame \
-        _x:=0 _y:=0 _z:=0 \
-        _qx:=0 _qy:=0 _qz:=0 _qw:=1
-
-Example (identity transform):
-    rosrun fast_livo smart_static_tf_bridge.py \
-        _parent:=aft_mapped \
-        _child:=camera_color_optical_frame
+Usage (one process manages any number of bridges, via launch file):
+    <node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
+        <rosparam param="bridges">
+            - {parent: aft_mapped, child: camera_imu_optical_frame}
+            - {parent: aft_mapped, child: base_link}
+        </rosparam>
+    </node>
+    (any key omitted per-item defaults to: parent=aft_mapped, child=camera_color_optical_frame,
+     translation 0, rotation identity, verify_root=odom)
 """
 
 import rospy
@@ -39,27 +37,28 @@ from tf.transformations import (
 )
 
 
-class SmartStaticTFBridge:
-    def __init__(self):
-        rospy.init_node('smart_static_tf_bridge', anonymous=False)
+class Bridge:
+    """One (parent, child) static-TF spec, its published/done state, and the
+    logic to resolve + publish it. Shares a single tf_buffer across all bridges
+    in the node (injected, not owned) so the node only opens one /tf listener."""
 
-        # Get desired transform parameters (default: identity)
-        self.parent_frame = rospy.get_param('~parent', 'aft_mapped')
-        self.child_frame = rospy.get_param('~child', 'camera_color_optical_frame')
-        self.x = rospy.get_param('~x', 0.0)
-        self.y = rospy.get_param('~y', 0.0)
-        self.z = rospy.get_param('~z', 0.0)
-        self.qx = rospy.get_param('~qx', 0.0)
-        self.qy = rospy.get_param('~qy', 0.0)
-        self.qz = rospy.get_param('~qz', 0.0)
-        self.qw = rospy.get_param('~qw', 1.0)
+    def __init__(self, spec, tf_buffer):
+        self.tf_buffer = tf_buffer
 
-        # TF buffer and listener
-        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        # Desired transform parameters (default: identity)
+        self.parent_frame = spec.get('parent', 'aft_mapped')
+        self.child_frame = spec.get('child', 'camera_color_optical_frame')
+        self.x = spec.get('x', 0.0)
+        self.y = spec.get('y', 0.0)
+        self.z = spec.get('z', 0.0)
+        self.qx = spec.get('qx', 0.0)
+        self.qy = spec.get('qy', 0.0)
+        self.qz = spec.get('qz', 0.0)
+        self.qw = spec.get('qw', 1.0)
+        self.verify_root = spec.get('verify_root', 'odom')
 
-        # Static transform broadcaster
-        self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
+        self.published = False
+        self.done = False
 
         rospy.loginfo("=" * 60)
         rospy.loginfo("Smart Static TF Bridge")
@@ -67,25 +66,6 @@ class SmartStaticTFBridge:
         rospy.loginfo(f"Desired transform: {self.parent_frame} → {self.child_frame}")
         rospy.loginfo(f"  Translation: [{self.x:.4f}, {self.y:.4f}, {self.z:.4f}]")
         rospy.loginfo(f"  Rotation (quat): [{self.qx:.4f}, {self.qy:.4f}, {self.qz:.4f}, {self.qw:.4f}]")
-
-    def wait_for_frame(self, frame_id, timeout=10.0):
-        """Wait for a frame to appear in TF tree."""
-        rospy.loginfo(f"Waiting for frame '{frame_id}'...")
-        start_time = rospy.Time.now()
-        rate = rospy.Rate(10)
-
-        while not rospy.is_shutdown():
-            if (rospy.Time.now() - start_time).to_sec() > timeout:
-                rospy.logerr(f"Timeout: Frame '{frame_id}' not found!")
-                return False
-
-            if frame_id in self.tf_buffer.all_frames_as_string():
-                rospy.loginfo(f"  ✓ Frame '{frame_id}' found")
-                return True
-
-            rate.sleep()
-
-        return False
 
     def find_root(self, frame_id):
         """Find the root frame of a TF tree by traversing parents.
@@ -96,7 +76,7 @@ class SmartStaticTFBridge:
         ONE publisher — with several static broadcasters up (camera, mavros, this
         bridge), whichever answers first wins, and if it is e.g. mavros's
         (map_ned/odom_ned), the camera frames are absent from it and the child is
-        misdeclared a root -> the run() guard then retries forever ("Camera tree
+        misdeclared a root -> the step() guard then retries forever ("Camera tree
         not formed yet" loop) even though the tree is fully formed.
         """
         import yaml
@@ -235,8 +215,9 @@ class SmartStaticTFBridge:
 
         return solution
 
-    def run(self):
-        """Main execution: retry until the full tree (verify_root -> child) resolves.
+    def step(self, broadcaster):
+        """One retry-loop iteration: check child present -> check tree formed ->
+        calculate_solution -> publish -> check verify_root->child resolved.
 
         One-shot publishing races a still-forming camera tree on startup (especially
         under CPU load): the bridge can fire before the RealSense static TFs are
@@ -248,55 +229,76 @@ class SmartStaticTFBridge:
         verify_root->child looks up end-to-end -- which also proves the live
         camera_init->aft_mapped link from LIO is up, not just our own static.
         """
-        verify_root = rospy.get_param('~verify_root', 'odom')
-        rospy.loginfo("\nWaiting for TF tree to populate...")
-        rospy.sleep(2.0)  # brief settle; the retry loop below handles the rest
+        # Need the child frame before we can find its root.
+        if self.child_frame not in self.tf_buffer.all_frames_as_string():
+            rospy.loginfo_throttle(10, f"Waiting for child frame '{self.child_frame}'...")
+            return self.done
 
-        rate = rospy.Rate(0.5)  # retry every 2s
-        published = False
-        while not rospy.is_shutdown():
-            # Need the child frame before we can find its root.
-            if self.child_frame not in self.tf_buffer.all_frames_as_string():
-                rospy.loginfo_throttle(10, f"Waiting for child frame '{self.child_frame}'...")
-                rate.sleep()
-                continue
+        # Guard the startup race: if find_root() still thinks the child is its own
+        # root, the camera tree's static TFs aren't visible yet. Publishing now
+        # would latch a wrong-root transform that conflicts once they appear.
+        if self.find_root(self.child_frame) == self.child_frame:
+            rospy.loginfo_throttle(10, f"Camera tree for '{self.child_frame}' not formed yet; retrying...")
+            return self.done
 
-            # Guard the startup race: if find_root() still thinks the child is its own
-            # root, the camera tree's static TFs aren't visible yet. Publishing now
-            # would latch a wrong-root transform that conflicts once they appear.
-            if self.find_root(self.child_frame) == self.child_frame:
-                rospy.loginfo_throttle(10, f"Camera tree for '{self.child_frame}' not formed yet; retrying...")
-                rate.sleep()
-                continue
+        solution = self.calculate_solution()
+        if solution is None:
+            return self.done
 
-            solution = self.calculate_solution()
-            if solution is None:
-                rate.sleep()
-                continue
+        broadcaster.sendTransform(solution)
+        if not self.published:
+            rospy.loginfo(f"Published {solution.header.frame_id} -> {solution.child_frame_id}; "
+                          f"verifying {self.verify_root} -> {self.child_frame} ...")
+            self.published = True
 
-            self.static_broadcaster.sendTransform(solution)
-            if not published:
-                rospy.loginfo(f"Published {solution.header.frame_id} -> {solution.child_frame_id}; "
-                              f"verifying {verify_root} -> {self.child_frame} ...")
-                published = True
+        # End-to-end check: confirms aft_mapped is linked all the way to the global
+        # root (live LIO odometry), not just to our own static transform.
+        if self.lookup_transform_safe(self.verify_root, self.child_frame, timeout=1.0) is not None:
+            rospy.loginfo(f"✓ TF tree connected: {self.verify_root} -> {self.child_frame}. Holding transform.")
+            self.done = True
+            return self.done
 
-            # End-to-end check: confirms aft_mapped is linked all the way to the global
-            # root (live LIO odometry), not just to our own static transform.
-            if self.lookup_transform_safe(verify_root, self.child_frame, timeout=1.0) is not None:
-                rospy.loginfo(f"✓ TF tree connected: {verify_root} -> {self.child_frame}. Holding transform.")
-                break
+        rospy.loginfo_throttle(10, f"Published, but {self.verify_root} -> {self.child_frame} not resolvable yet; retrying...")
+        return self.done
 
-            rospy.loginfo_throttle(10, f"Published, but {verify_root} -> {self.child_frame} not resolvable yet; retrying...")
+
+def main():
+    rospy.init_node('smart_static_tf_bridge', anonymous=False)
+
+    # ~bridges: list of dicts, one per (parent, child) pair. The only supported
+    # interface -- every caller sets it (no flat-param single-bridge mode).
+    specs = rospy.get_param('~bridges', None)
+    if not specs:
+        rospy.logfatal("~bridges rosparam missing/empty -- nothing to bridge. Set a list "
+                        "of {parent, child, ...} dicts on this node.")
+        return
+
+    # Shared buffer/listener/broadcaster: one /tf subscription for every bridge,
+    # not N. Single-threaded round-robin below, no threads/locks needed.
+    tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
+    tf_listener = tf2_ros.TransformListener(tf_buffer)
+    broadcaster = tf2_ros.StaticTransformBroadcaster()
+
+    bridges = [Bridge(spec, tf_buffer) for spec in specs]
+
+    rospy.loginfo("\nWaiting for TF tree to populate...")
+    rospy.sleep(2.0)  # brief settle; the retry loop below handles the rest
+
+    rate = rospy.Rate(0.5)  # retry every 2s
+    while not rospy.is_shutdown() and not all(b.done for b in bridges):
+        for b in bridges:
+            if not b.done:
+                b.step(broadcaster)
+        if not all(b.done for b in bridges):
             rate.sleep()
 
-        # Keep node alive to maintain the latched static transform.
-        rospy.spin()
+    # Keep node alive to maintain the latched static transforms.
+    rospy.spin()
 
 
 if __name__ == '__main__':
     try:
-        bridge = SmartStaticTFBridge()
-        bridge.run()
+        main()
     except rospy.ROSInterruptException:
         pass
     except Exception as e:
