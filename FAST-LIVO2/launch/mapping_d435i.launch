@@ -61,10 +61,9 @@
 	     TF authority; enabling it would add a second, independently-converging
 	     odom->body tree. -->
 	<node pkg="fast_livo" type="smart_static_tf_bridge.py" name="smart_tf_bridge" output="log">
-		<rosparam param="bridges">
-			- {parent: aft_mapped, child: camera_imu_optical_frame}
-			- {parent: aft_mapped, child: base_link}
-		</rosparam>
+        <rosparam param="bridges">
+            - {parent: base_link, child: camera_depth_optical_frame, x: 0.076998, y: 0.008339, z: 0.030436, qx: 0.496244, qy: -0.499864, qz: 0.509684, qw: -0.494064}
+        </rosparam>
 	</node>
 
 	<!-- Divergence guard: if |pos| ever exceeds max_dist the estimate has already

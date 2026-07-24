@@ -245,6 +245,32 @@ class Bridge:
         if solution is None:
             return self.done
 
+        # Cycle guard: calculate_solution() resolved the child's root and wants to
+        # publish parent -> root. If that root is ALREADY connected to parent in the
+        # live tree, the root is upstream of parent (e.g. root == camera_init while
+        # FAST-LIVO publishes the live camera_init -> aft_mapped) and publishing
+        # parent -> root closes a loop -> the whole TF tree goes invalid and every
+        # lookup fails. In that case the child is already reachable from parent via
+        # the existing tree, so no bridge is needed. This is exactly the stack-
+        # agnostic contract: bridge ONLY a genuinely disconnected child subtree
+        # (root not yet linked to parent); never re-root onto an ancestor.
+        root_frame = solution.child_frame_id
+        if root_frame != self.parent_frame and \
+                self.tf_buffer.can_transform(root_frame, self.parent_frame, rospy.Time(0)):
+            if self.lookup_transform_safe(self.verify_root, self.child_frame, timeout=1.0) is not None:
+                rospy.loginfo_throttle(
+                    10,
+                    f"'{self.child_frame}' already reachable from '{self.parent_frame}' "
+                    f"via the live tree (root '{root_frame}'); no bridge needed. Holding.")
+                self.done = True
+            else:
+                rospy.logwarn_throttle(
+                    10,
+                    f"Resolved root '{root_frame}' already connects to '{self.parent_frame}' "
+                    f"(publishing would cycle); not publishing. Waiting for "
+                    f"'{self.child_frame}' to settle onto an independent root.")
+            return self.done
+
         broadcaster.sendTransform(solution)
         if not self.published:
             rospy.loginfo(f"Published {solution.header.frame_id} -> {solution.child_frame_id}; "
