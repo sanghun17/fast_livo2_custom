@@ -17,7 +17,6 @@ which is included as part of this source code package.
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
-#include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
 #include <vikit/camera_loader.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -29,7 +28,7 @@ class LIVMapper
 public:
   LIVMapper(ros::NodeHandle &nh);
   ~LIVMapper();
-  void initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
+  void initializeSubscribersAndPublishers(ros::NodeHandle &nh);
   void initializeComponents();
   void initializeFiles();
   void run();
@@ -57,7 +56,7 @@ public:
   void gt_odom_cbk(const geometry_msgs::PoseStamped::ConstPtr &msg_in);
   // re-anchor on demand (std_msgs/Empty trigger): reset LIVO state, re-latch next pose.
   void reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in);
-  void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
+  void publish_img_rgb(const ros::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
@@ -212,7 +211,7 @@ public:
   ros::Publisher pubLaserCloudDyn;
   ros::Publisher pubLaserCloudDynRmed;
   ros::Publisher pubLaserCloudDynDbg;
-  image_transport::Publisher pubImage;
+  ros::Publisher pubImage;
   ros::Timer imu_prop_timer;
 
   int frame_num = 0;

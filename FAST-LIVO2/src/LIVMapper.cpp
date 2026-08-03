@@ -451,7 +451,7 @@ void LIVMapper::initializeFiles()
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
 }
 
-void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
+void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh)
 {
   sub_pcl = p_pre->lidar_type == AVIA ? 
             nh.subscribe(lid_topic, 10, &LIVMapper::livox_pcl_cbk, this): 
@@ -481,7 +481,13 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudDyn = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj", 100);
   pubLaserCloudDynRmed = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_removed", 100);
   pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
-  pubImage = it.advertise("/rgb_img", 1);
+  // /rgb_img is a BGR debug image, not a depth image.  Publishing it through
+  // image_transport advertises every installed transport, including
+  // /rgb_img/compressedDepth.  A record-all rosbag then subscribes to that
+  // invalid transport and compressed_depth_image_transport logs an error for
+  // every frame.  A plain Image publisher keeps the useful raw RViz topic and
+  // does not advertise inapplicable depth transports.
+  pubImage = nh.advertise<sensor_msgs::Image>("/rgb_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_body_imu_propagated", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
@@ -1520,7 +1526,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
   ROS_ERROR("out sync");
 }
 
-void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
+void LIVMapper::publish_img_rgb(const ros::Publisher &pubImage, VIOManagerPtr vio_manager)
 {
   cv::Mat img_rgb = vio_manager->img_cp;
   cv_bridge::CvImage out_msg;
