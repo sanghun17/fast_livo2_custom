@@ -212,9 +212,12 @@ public:
 
   geometry_msgs::Quaternion geoQuat_;
 
-  int feats_down_size_;
-  int effct_feat_num_;
+  int feats_down_size_ = 0;
+  int effct_feat_num_ = 0;
   M3D raw_rot_lio_ = M3D::Identity();   // debug: raw prior-free GN measurement-implied rotation (iter0), for fusion_log
+  double last_translation_info_ratio_ = 0.0;  // min/max eigenvalue of H_t' R^-1 H_t
+  double last_rotation_info_ratio_ = 0.0;     // min/max eigenvalue of H_r' R^-1 H_r
+  double last_info_min_per_feature_ = 0.0;    // full 6-DoF min eigenvalue / support
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;

@@ -64,6 +64,7 @@ public:
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
   void publish_body_optitrack();  // /aft_mapped_to_body (+ /aft_mapped_to_optitrack) via hand-eye T_cam2body
   void publish_path(const ros::Publisher pubPath);
+  ros::Time estimator_stamp() const;
   void readParameters(ros::NodeHandle &nh);
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
@@ -101,6 +102,7 @@ public:
 
   double res_mean_last = 0.05;
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;
+  double b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
@@ -124,6 +126,7 @@ public:
   double lidar_time_offset = 0.0;
 
   bool gravity_align_en = false, gravity_align_finished = false, imu_only_mode = false, fusion_debug = false, vio_flip_roll = false, vio_flip_pitch = false;
+  int vio_max_lio_features_for_fusion = -1;
   FILE *dbg_fp = nullptr;   // debug-only per-frame fusion/preintegration log (debug/fusion_log)
 
   bool sync_jump_flag = false;

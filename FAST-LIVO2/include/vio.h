@@ -120,7 +120,16 @@ public:
   bool plot_flag;
   bool verbose = false;   // gate per-frame VIO console spam (injected from LIVMapper debug/verbose)
   bool flip_roll = false, flip_pitch = false;   // debug: negate VIO roll/pitch update component (test sign hypothesis)
+  // When false, keep tracking/reference-map maintenance active but skip the
+  // visual EKF correction for this frame.  LIVMapper drives this from the
+  // immediately preceding LIO support count.
+  bool state_update_enabled = true;
   M3D raw_rot_vio_ = M3D::Identity();   // debug: raw prior-free GN measurement-implied rotation (iter0), for fusion_log
+  double last_inlier_ratio = 0.0;       // patches whose final error <= propagated error
+  double last_error_ratio = 1.0;        // sum(final patch SSE) / sum(propagated patch SSE)
+  double last_translation_info_ratio = 0.0;
+  double last_rotation_info_ratio = 0.0;
+  double last_info_min_per_measurement = 0.0;
 
   Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;

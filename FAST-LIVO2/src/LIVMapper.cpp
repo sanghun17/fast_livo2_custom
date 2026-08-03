@@ -14,8 +14,142 @@ which is included as part of this source code package.
 #include <sensor_msgs/CameraInfo.h>
 #include <ros/topic.h>
 #include <cstdlib>
+#include <cmath>
 
 namespace {
+// Runtime-disabled by default.  The offline campaign enables this explicitly
+// while establishing thresholds; production behaviour is unchanged unless the
+// complete health_guard block is present in the loaded yaml.
+struct EstimatorHealthGuard
+{
+  bool enabled = false;
+  int min_lio_features = 50;
+  int min_vio_features = 40;
+  double min_vio_inlier_ratio = 0.0;
+  int hold_after_rejects = 5;
+  bool update_map_on_reject = false;
+  double max_position_update = 0.75;       // measurement correction, metres
+  double max_rotation_update = 5.0 / 57.29577951308232;  // radians
+  double max_speed = 3.0;                  // m/s, above the 2 m/s flight limit
+  double step_margin = 0.15;               // metres, timestamp/jitter allowance
+  double max_tilt = 20.0 / 57.29577951308232;  // body-z from initialized up
+
+  bool initialized = false;
+  int consecutive_rejects = 0;
+  double last_time = 0.0;
+  StatesGroup last_state;
+  V3D reference_up = V3D(0.0, 0.0, 1.0);
+  V3D body_z_in_imu = V3D(0.0, 0.0, 1.0);
+  bool last_rejected = false;
+  unsigned int last_reject_mask = 0;
+  double last_position_update = 0.0;
+  double last_rotation_update = 0.0;
+  double last_speed = 0.0;
+  double last_step = 0.0;
+  double last_tilt = 0.0;
+
+  void reset()
+  {
+    initialized = false;
+    consecutive_rejects = 0;
+    last_time = 0.0;
+    last_state = StatesGroup();
+  }
+
+  bool apply(const char *stage, int support, double quality,
+             const StatesGroup &propagated,
+             StatesGroup &candidate, double stamp)
+  {
+    if (!enabled) return false;
+    if (!initialized || stamp < last_time || stamp - last_time > 1.0)
+    {
+      initialized = true;
+      consecutive_rejects = 0;
+      last_time = stamp;
+      last_state = candidate;
+      reference_up = (candidate.rot_end * body_z_in_imu).normalized();
+      return false;
+    }
+
+    const int min_support = stage[0] == 'L' ? min_lio_features : min_vio_features;
+    const double raw_dt = stamp - last_time;
+    const bool same_epoch = raw_dt <= 1e-4;
+    const double dt = std::max(1e-3, std::min(0.5, raw_dt));
+    const double pos_update = (candidate.pos_end - propagated.pos_end).norm();
+    const M3D rot_delta = propagated.rot_end.transpose() * candidate.rot_end;
+    const double rot_update = Log(rot_delta).norm();
+    const double speed = candidate.vel_end.norm();
+    const double step = (candidate.pos_end - last_state.pos_end).norm();
+    const V3D candidate_up = (candidate.rot_end * body_z_in_imu).normalized();
+    const double up_dot = std::max(-1.0, std::min(1.0,
+        candidate_up.dot(reference_up)));
+    const double tilt = std::acos(up_dot);
+    const bool finite = candidate.pos_end.allFinite() && candidate.vel_end.allFinite() &&
+                        candidate.rot_end.allFinite() && candidate.cov.allFinite();
+    const bool low_support = support < min_support;
+    const bool low_quality = stage[0] == 'V' && quality < min_vio_inlier_ratio;
+    const bool bad_update = pos_update > max_position_update ||
+                            rot_update > max_rotation_update;
+    // LIO and VIO update sequentially at the exact same sensor timestamp.
+    // Their within-epoch measurement correction is not physical travel and is
+    // already bounded by max_position_update; apply the step gate only when
+    // time actually advances to the next sensor frame.
+    const bool bad_motion = speed > max_speed ||
+                            (!same_epoch && step > max_speed * dt + step_margin);
+    const bool bad_tilt = tilt > max_tilt;
+    const bool rejected = !finite || low_support || low_quality ||
+                          bad_update || bad_motion || bad_tilt;
+    last_rejected = rejected;
+    last_reject_mask = (!finite ? 1u : 0u) |
+                       (low_support ? 2u : 0u) |
+                       (low_quality ? 4u : 0u) |
+                       (bad_update ? 8u : 0u) |
+                       (bad_motion ? 16u : 0u) |
+                       (bad_tilt ? 32u : 0u);
+    last_position_update = pos_update;
+    last_rotation_update = rot_update;
+    last_speed = speed;
+    last_step = step;
+    last_tilt = tilt;
+
+    if (rejected)
+    {
+      ++consecutive_rejects;
+      // First reject only removes the suspect measurement update.  If both
+      // modalities remain unobservable, stop translation after a short grace
+      // interval instead of integrating a small tilt error into kilometre-scale
+      // acceleration.  Bias/gravity/covariance still come from propagation.
+      candidate = finite ? propagated : last_state;
+      if (!candidate.pos_end.allFinite() || !candidate.vel_end.allFinite())
+        candidate = last_state;
+      if (bad_tilt || !candidate.rot_end.allFinite())
+        candidate.rot_end = last_state.rot_end;
+      if (consecutive_rejects >= hold_after_rejects ||
+          candidate.vel_end.norm() > max_speed ||
+          (candidate.pos_end - last_state.pos_end).norm() > max_speed * dt + step_margin)
+      {
+        candidate.pos_end = last_state.pos_end;
+        candidate.vel_end.setZero();
+      }
+      ROS_WARN_THROTTLE(1.0,
+          "[health_guard] reject %s: support=%d/%d pos_update=%.3fm "
+          "quality=%.2f rot_update=%.2fdeg tilt=%.1fdeg speed=%.2fm/s streak=%d%s",
+          stage, support, min_support, pos_update, rot_update * 57.29577951308232,
+          quality, tilt * 57.29577951308232, speed, consecutive_rejects,
+          consecutive_rejects >= hold_after_rejects ? " HOLD" : "");
+    }
+    else
+    {
+      consecutive_rejects = 0;
+    }
+    last_time = stamp;
+    last_state = candidate;
+    return rejected;
+  }
+};
+
+EstimatorHealthGuard health_guard;
+
 // Pick the vikit camera model from a distortion-model string and build it.
 // radtan/plumb_bob (and empty) -> PinholeCamera; fisheye/equidistant -> EquidistantCamera.
 vk::AbstractCamera *makeCamera(const std::string &dist_model, double w, double h, double scale,
@@ -94,6 +228,27 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("debug/fusion_log", fusion_debug, false);        // debug-only: log per-frame IMU-prop vs post-LIO/VIO attitude to /tmp/fusion_debug.csv
   nh.param<bool>("debug/vio_flip_roll", vio_flip_roll, false);    // debug-only: negate the VIO roll state update
   nh.param<bool>("debug/vio_flip_pitch", vio_flip_pitch, false);  // debug-only: negate the VIO pitch state update
+  // -1 preserves upstream always-on fusion.  A non-negative value enables a
+  // sensor-health fallback: VIO corrects the state only when the immediately
+  // preceding LIO update has at most this many effective point-plane features.
+  nh.param<int>("vio/max_lio_features_for_fusion",
+                vio_max_lio_features_for_fusion, -1);
+  nh.param<bool>("health_guard/enabled", health_guard.enabled, false);
+  nh.param<int>("health_guard/min_lio_features", health_guard.min_lio_features, 50);
+  nh.param<int>("health_guard/min_vio_features", health_guard.min_vio_features, 40);
+  nh.param<double>("health_guard/min_vio_inlier_ratio", health_guard.min_vio_inlier_ratio, 0.0);
+  nh.param<int>("health_guard/hold_after_rejects", health_guard.hold_after_rejects, 5);
+  nh.param<bool>("health_guard/update_map_on_reject", health_guard.update_map_on_reject, false);
+  nh.param<double>("health_guard/max_position_update", health_guard.max_position_update, 0.75);
+  double max_rotation_update_deg = 5.0;
+  nh.param<double>("health_guard/max_rotation_update_deg", max_rotation_update_deg, 5.0);
+  health_guard.max_rotation_update = max_rotation_update_deg / 57.29577951308232;
+  nh.param<double>("health_guard/max_speed", health_guard.max_speed, 3.0);
+  nh.param<double>("health_guard/step_margin", health_guard.step_margin, 0.15);
+  double max_tilt_deg = 20.0;
+  nh.param<double>("health_guard/max_tilt_deg", max_tilt_deg, 20.0);
+  health_guard.max_tilt = max_tilt_deg / 57.29577951308232;
+  health_guard.reset();
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
   nh.param<bool>("common/online_intrinsics_en", online_intrinsics_en, false);
   nh.param<string>("common/cam_info_topic", cam_info_topic, "");
@@ -128,6 +283,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("evo/pose_output_en", pose_output_en, false);
   nh.param<double>("imu/gyr_cov", gyr_cov, 1.0);
   nh.param<double>("imu/acc_cov", acc_cov, 1.0);
+  nh.param<double>("imu/b_gyr_cov", b_gyr_cov, 0.0001);
+  nh.param<double>("imu/b_acc_cov", b_acc_cov, 0.0001);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
@@ -246,12 +403,18 @@ void LIVMapper::initializeComponents()
   vio_manager->colmap_output_en = colmap_output_en;
   vio_manager->initializeVIO();
 
+  // State rotation is world<-IMU, not world<-vehicle-body.  Express the
+  // vehicle's +Z axis in IMU coordinates before applying the tilt envelope:
+  // R_WB = R_WI * inv(R_CI) * inv(R_BC).
+  health_guard.body_z_in_imu =
+      (vio_manager->Rci.transpose() * R_cam2body.transpose() * V3D(0, 0, 1)).normalized();
+
   p_imu->set_extrinsic(extT, extR);
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));
   p_imu->set_acc_cov_scale(V3D(acc_cov, acc_cov, acc_cov));
   p_imu->set_inv_expo_cov(inv_expo_cov);
-  p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
-  p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
+  p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+  p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
   p_imu->set_imu_init_frame_num(imu_int_frame);
 
   if (!imu_en) p_imu->disable_imu();
@@ -410,14 +573,38 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
+  // VIO follows LIO at the same sensor epoch.  Its rollback base must retain
+  // the accepted LIO correction; state_propagat is the older IMU-only prior.
+  const StatesGroup state_before_vio = _state;
+  vio_manager->state_update_enabled =
+      vio_max_lio_features_for_fusion < 0 ||
+      voxelmap_manager->effct_feat_num_ <= vio_max_lio_features_for_fusion;
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
+  const bool health_rejected = health_guard.apply(
+      "VIO", vio_manager->total_points, vio_manager->last_inlier_ratio,
+      state_before_vio, _state,
+      LidarMeasures.last_lio_update_time);
+  if (health_rejected) vio_manager->updateFrameState(_state);
+
   if (fusion_debug) {  // debug-only: log post-VIO internal quaternion (mapped to world offline) vs GT
-    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw\n"); }
+    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw,vio_inlier_ratio,vio_error_ratio,rejected,reject_mask,pos_update,rot_update_deg,speed,step,tilt_deg,lio_trans_info_ratio,lio_rot_info_ratio,lio_info_min_per_feature,vio_trans_info_ratio,vio_rot_info_ratio,vio_info_min_per_measurement\n"); }
     Eigen::Quaterniond qp(state_propagat.rot_end), qo(_state.rot_end), qr(vio_manager->raw_rot_vio_);
-    fprintf(dbg_fp, "%.4f,VIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f\n",
+    fprintf(dbg_fp, "%.4f,VIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%d,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
             LidarMeasures.last_lio_update_time - _first_lidar_time, qp.x(), qp.y(), qp.z(), qp.w(), qo.x(), qo.y(), qo.z(), qo.w(),
-            vio_manager->total_points, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w());
+            vio_manager->total_points, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w(),
+            vio_manager->last_inlier_ratio, vio_manager->last_error_ratio,
+            health_guard.last_rejected ? 1 : 0, health_guard.last_reject_mask,
+            health_guard.last_position_update,
+            health_guard.last_rotation_update * 57.29577951308232,
+            health_guard.last_speed, health_guard.last_step,
+            health_guard.last_tilt * 57.29577951308232,
+            voxelmap_manager->last_translation_info_ratio_,
+            voxelmap_manager->last_rotation_info_ratio_,
+            voxelmap_manager->last_info_min_per_feature_,
+            vio_manager->last_translation_info_ratio,
+            vio_manager->last_rotation_info_ratio,
+            vio_manager->last_info_min_per_measurement);
     fflush(dbg_fp);
   }
 
@@ -497,13 +684,29 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+  const bool health_rejected = health_guard.apply(
+      "LIO", voxelmap_manager->effct_feat_num_, 1.0, state_propagat, _state,
+      LidarMeasures.last_lio_update_time);
+  if (health_rejected) voxelmap_manager->state_ = _state;
 
   if (fusion_debug) {  // debug-only: log post-LIO internal quaternion (mapped to world offline) vs GT
-    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw\n"); }
+    if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw,vio_inlier_ratio,vio_error_ratio,rejected,reject_mask,pos_update,rot_update_deg,speed,step,tilt_deg,lio_trans_info_ratio,lio_rot_info_ratio,lio_info_min_per_feature,vio_trans_info_ratio,vio_rot_info_ratio,vio_info_min_per_measurement\n"); }
     Eigen::Quaterniond qp(state_propagat.rot_end), qo(_state.rot_end), qr(voxelmap_manager->raw_rot_lio_);
-    fprintf(dbg_fp, "%.4f,LIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f\n",
+    fprintf(dbg_fp, "%.4f,LIO,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%d,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
             LidarMeasures.last_lio_update_time - _first_lidar_time, qp.x(), qp.y(), qp.z(), qp.w(), qo.x(), qo.y(), qo.z(), qo.w(),
-            voxelmap_manager->effct_feat_num_, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w());
+            voxelmap_manager->effct_feat_num_, _state.pos_end[0], _state.pos_end[1], _state.pos_end[2], qr.x(), qr.y(), qr.z(), qr.w(),
+            vio_manager->last_inlier_ratio, vio_manager->last_error_ratio,
+            health_guard.last_rejected ? 1 : 0, health_guard.last_reject_mask,
+            health_guard.last_position_update,
+            health_guard.last_rotation_update * 57.29577951308232,
+            health_guard.last_speed, health_guard.last_step,
+            health_guard.last_tilt * 57.29577951308232,
+            voxelmap_manager->last_translation_info_ratio_,
+            voxelmap_manager->last_rotation_info_ratio_,
+            voxelmap_manager->last_info_min_per_feature_,
+            vio_manager->last_translation_info_ratio,
+            vio_manager->last_rotation_info_ratio,
+            vio_manager->last_info_min_per_measurement);
     fflush(dbg_fp);
   }
 
@@ -558,7 +761,12 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+  // Optional recovery mode: insert a rejected scan at the bounded/held state.
+  // Without this, a low-support episode can become permanent because the map
+  // never gains enough nearby surfaces to match subsequent scans.  This is
+  // disabled by default and evaluated explicitly by the offline campaign.
+  if (!health_rejected || health_guard.update_map_on_reject)
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   if (verbose) std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   
@@ -1478,11 +1686,24 @@ template <typename T> void LIVMapper::set_posestamp(T &out)
   out.orientation.w = geoQuat.w;
 }
 
+ros::Time LIVMapper::estimator_stamp() const
+{
+  // _state is the estimate at this sensor epoch, not at callback completion.
+  // Stamping it with ros::Time::now() made replay latency look like motion and
+  // produced run-dependent 30--240 ms trajectory offsets.  Preserve `now` only
+  // as a defensive startup fallback before the first synchronized measurement.
+  ros::Time stamp = ros::Time::now();
+  if (std::isfinite(LidarMeasures.last_lio_update_time) &&
+      LidarMeasures.last_lio_update_time > 0.0)
+    stamp.fromSec(LidarMeasures.last_lio_update_time);
+  return stamp;
+}
+
 void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "aft_mapped";
-  odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
+  odomAftMapped.header.stamp = estimator_stamp();
   set_posestamp(odomAftMapped.pose.pose);
 
   static tf::TransformBroadcaster br;
@@ -1515,7 +1736,7 @@ void LIVMapper::publish_body_optitrack()
   T_BC.linear() = R_cam2body;      T_BC.translation() = t_cam2body;                 // p_body = R p_cam + t
   Eigen::Isometry3d T_WB = T_WI * T_CI.inverse() * T_BC.inverse();
 
-  ros::Time now = ros::Time::now();
+  const ros::Time now = estimator_stamp();
   // /aft_mapped_to_body lives in the ROS-oriented W_L frame. T_WB is in the OPTICAL
   // camera_init world (gravity_align off), so left-multiply the optical->ROS world flip
   // q_o2r=(x,y,z,w)=(0.5,-0.5,0.5,-0.5) — the same bridge the old /aft_mapped_to_odom
@@ -1619,12 +1840,13 @@ void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
   lidar_map_inited = false;
   ekf_finish_once = false;
   is_first_frame = true;
+  health_guard.reset();
 }
 
 void LIVMapper::publish_path(const ros::Publisher pubPath)
 {
   set_posestamp(msg_body_pose.pose);
-  msg_body_pose.header.stamp = ros::Time::now();
+  msg_body_pose.header.stamp = estimator_stamp();
   msg_body_pose.header.frame_id = "camera_init";
   path.poses.push_back(msg_body_pose);
   pubPath.publish(path);

@@ -1543,15 +1543,13 @@ void VIOManager::updateState(cv::Mat img, int level)
     Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
     Jdp_dt = Rci * Rwi.transpose();
     
-    float error = 0.0;
-    int n_meas = 0;
     // int max_threads = omp_get_max_threads();
     // int desired_threads = std::min(max_threads, total_points);
     // omp_set_num_threads(desired_threads);
   
     #ifdef MP_EN
       omp_set_num_threads(MP_PROC_NUM);
-      #pragma omp parallel for reduction(+:error, n_meas)
+      #pragma omp parallel for
     #endif
     for (int i = 0; i < total_points; i++)
     {
@@ -1623,17 +1621,30 @@ void VIOManager::updateState(cv::Mat img, int level)
           z(i * patch_size_total + x * patch_size + y) = res;
 
           patch_error += res * res;
-          n_meas += 1;
-          
           if (exposure_estimate_en) { H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt, cur_value; }
           else { H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt; }
         }
       }
       visual_submap->errors[i] = patch_error;
-      error += patch_error;
     }
 
-    error = error / n_meas;
+    // Keep the expensive Jacobian/residual evaluation parallel, but make the
+    // scalar objective deterministic.  An OpenMP float reduction changes its
+    // summation order between runs; this value controls the accept/rollback
+    // branch below, so a sub-ULP difference can send the iterative EKF down a
+    // different trajectory.  Summing one patch error per point in index order
+    // is cheap and gives replayable update decisions.
+    double error_sum = 0.0;
+    int n_meas = 0;
+    for (int i = 0; i < total_points; ++i)
+    {
+      if (visual_submap->voxel_points[i] == nullptr) continue;
+      error_sum += static_cast<double>(visual_submap->errors[i]);
+      n_meas += patch_size_total;
+    }
+    const float error = n_meas > 0
+                            ? static_cast<float>(error_sum / static_cast<double>(n_meas))
+                            : std::numeric_limits<float>::infinity();
     
     compute_jacobian_time += omp_get_wtime() - t1;
 
@@ -1658,6 +1669,20 @@ void VIOManager::updateState(cv::Mat img, int level)
       H_T_H.setZero();
       G.setZero();
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
+      const MD(6, 6) pose_info = 0.5 * (H_T_H.block<6, 6>(0, 0) +
+                                             H_T_H.block<6, 6>(0, 0).transpose());
+      Eigen::SelfAdjointEigenSolver<M3D> trans_solver(pose_info.block<3, 3>(3, 3));
+      Eigen::SelfAdjointEigenSolver<M3D> rot_solver(pose_info.block<3, 3>(0, 0));
+      Eigen::SelfAdjointEigenSolver<MD(6, 6)> full_solver(pose_info);
+      const auto trans_eigs = trans_solver.eigenvalues();
+      const auto rot_eigs = rot_solver.eigenvalues();
+      const auto full_eigs = full_solver.eigenvalues();
+      last_translation_info_ratio = std::max(0.0, trans_eigs[0]) /
+                                    std::max(1e-12, trans_eigs[2]);
+      last_rotation_info_ratio = std::max(0.0, rot_eigs[0]) /
+                                 std::max(1e-12, rot_eigs[2]);
+      last_info_min_per_measurement = std::max(0.0, full_eigs[0]) /
+                                      std::max(1, n_meas);
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       auto &&HTz = H_sub_T * z;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
@@ -1796,6 +1821,9 @@ void VIOManager::dumpDataForColmap()
 
 void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
 {
+  last_translation_info_ratio = 0.0;
+  last_rotation_info_ratio = 0.0;
+  last_info_min_per_measurement = 0.0;
   if (width != img.cols || height != img.rows)
   {
     if (img.empty()) printf("[ VIO ] Empty Image!\n");
@@ -1818,7 +1846,41 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t2 = omp_get_wtime();
 
-  computeJacobianAndUpdateEKF(img);
+  if (state_update_enabled)
+  {
+    computeJacobianAndUpdateEKF(img);
+  }
+  else
+  {
+    // Tracking and visual-map maintenance below still run at the accepted LIO
+    // pose.  Do not let a stale G from the previous frame touch covariance.
+    G.setZero();
+    updateFrameState(*state);
+  }
+
+  // The upstream visualizer already labels a patch as tracked when its final
+  // photometric error is no worse than the propagated pose.  Preserve the
+  // aggregate instead of throwing it away so fusion can assess measurement
+  // quality without GT or a new image pass.
+  int improved = 0;
+  double final_error_sum = 0.0;
+  double propagated_error_sum = 0.0;
+  const size_t quality_count = std::min(visual_submap->errors.size(),
+                                        visual_submap->propa_errors.size());
+  for (size_t i = 0; i < quality_count; ++i)
+  {
+    const double final_error = visual_submap->errors[i];
+    const double propagated_error = visual_submap->propa_errors[i];
+    if (std::isfinite(final_error) && std::isfinite(propagated_error))
+    {
+      if (final_error <= propagated_error) ++improved;
+      final_error_sum += final_error;
+      propagated_error_sum += propagated_error;
+    }
+  }
+  last_inlier_ratio = quality_count ? static_cast<double>(improved) / quality_count : 0.0;
+  last_error_ratio = propagated_error_sum > 1e-9
+      ? final_error_sum / propagated_error_sum : 1.0;
 
   double t3 = omp_get_wtime();
 

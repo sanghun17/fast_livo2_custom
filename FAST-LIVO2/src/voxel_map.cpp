@@ -466,6 +466,23 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    // Feature count alone does not reveal geometric degeneracy (e.g. many
+    // points on one wall).  Preserve scale-free translation/rotation
+    // observability ratios for the fusion guard diagnostics.
+    const MD(6, 6) info = 0.5 * (H_T_H.block<6, 6>(0, 0) +
+                                      H_T_H.block<6, 6>(0, 0).transpose());
+    Eigen::SelfAdjointEigenSolver<M3D> trans_solver(info.block<3, 3>(3, 3));
+    Eigen::SelfAdjointEigenSolver<M3D> rot_solver(info.block<3, 3>(0, 0));
+    Eigen::SelfAdjointEigenSolver<MD(6, 6)> full_solver(info);
+    const auto trans_eigs = trans_solver.eigenvalues();
+    const auto rot_eigs = rot_solver.eigenvalues();
+    const auto full_eigs = full_solver.eigenvalues();
+    last_translation_info_ratio_ = std::max(0.0, trans_eigs[0]) /
+                                   std::max(1e-12, trans_eigs[2]);
+    last_rotation_info_ratio_ = std::max(0.0, rot_eigs[0]) /
+                                std::max(1e-12, rot_eigs[2]);
+    last_info_min_per_feature_ = std::max(0.0, full_eigs[0]) /
+                                 std::max(1, effct_feat_num_);
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);

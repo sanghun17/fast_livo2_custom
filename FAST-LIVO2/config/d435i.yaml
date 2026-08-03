@@ -87,6 +87,12 @@ vio:
   inverse_composition_en: false
   exposure_estimate_en: true
   inv_expo_cov: 0.1
+  # 2026-08-03 multi-flight campaign: keep visual tracking/map maintenance on
+  # every frame, but apply the visual EKF correction only when the immediately
+  # preceding LIO update has <=50 effective point-plane features.  This kept
+  # VIO's benefit on LiDAR-weak flights without its always-on path inflation.
+  # Validated on 9 camera+VIO flight bags at 0.5x and 1.0x: 0/9 catastrophic.
+  max_lio_features_for_fusion: 50
 
 imu:
   imu_en: true
@@ -94,8 +100,11 @@ imu:
   # Initial values - need Allan variance calibration
   acc_cov: 0.1           # TUNED (was 0.5): low IMU-trust (imu=lo) best across grid
   gyr_cov: 0.1           # TUNED (was 0.3)
-  b_acc_cov: 0.0005      # TUNED (was 0.001): bias_RW flat handle, blo marginally best
-  b_gyr_cov: 0.0005      # TUNED (was 0.001)
+  # The executable historically hard-coded 0.0001 and ignored these two YAML
+  # keys.  The loader now honors them; retain the actual historical runtime
+  # value used by the 2026-08-03 nine-bag validation.
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
 
 lio:
   max_iterations: 5
@@ -107,6 +116,23 @@ lio:
   max_layer: 1            # TUNED (was 2): shallower octree more robust; flat-ish handle
   max_points_num: 50
   layer_init_num: [5, 5, 5, 5, 5]
+
+# Runtime estimator envelope promoted from the 2026-08-03 offline campaign.
+# A rejected measurement rolls back to the propagated/last trusted state; a
+# persistent no-observation interval holds translation instead of integrating
+# a small attitude error into an unbounded acceleration drift.
+health_guard:
+  enabled: true
+  min_lio_features: 50
+  min_vio_features: 40
+  min_vio_inlier_ratio: 0.0
+  hold_after_rejects: 5
+  update_map_on_reject: true
+  max_position_update: 0.75       # m per measurement correction
+  max_rotation_update_deg: 5.0    # deg per measurement correction
+  max_speed: 2.0                  # m/s, matches flight envelope
+  step_margin: 0.05               # m timestamp/jitter allowance
+  max_tilt_deg: 20.0              # deg from initialized vehicle up
 
 local_map:
   map_sliding_en: false
