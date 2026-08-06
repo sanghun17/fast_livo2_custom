@@ -39,6 +39,7 @@ void ImuProcess::Reset()
   mean_acc = V3D(0, 0, -1.0);
   mean_gyr = V3D(0, 0, 0);
   angvel_last = Zero3d;
+  last_prop_end_time = 0.0;
   imu_need_init = true;
   init_iter_num = 1;
   IMUpose.clear();
@@ -570,6 +571,10 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
+      // The first post-initialization propagation must start at the sensor
+      // epoch represented by the final initialization frame.  Leaving this
+      // unset made its first dt depend on uninitialized memory.
+      last_prop_end_time = pcl_end_time;
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],

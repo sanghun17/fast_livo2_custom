@@ -77,7 +77,7 @@ private:
   V3D mean_gyr;
   V3D angvel_last;
   V3D acc_s_last;
-  double last_prop_end_time;
+  double last_prop_end_time = 0.0;
   double time_last_scan;
   int init_iter_num = 1, MAX_INI_COUNT = 20;
   bool b_first_frame = true;
