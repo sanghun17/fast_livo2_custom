@@ -117,23 +117,6 @@ lio:
   max_points_num: 50
   layer_init_num: [5, 5, 5, 5, 5]
 
-# Runtime estimator envelope promoted from the 2026-08-03 offline campaign.
-# A rejected measurement rolls back to the propagated/last trusted state; a
-# persistent no-observation interval holds translation instead of integrating
-# a small attitude error into an unbounded acceleration drift.
-health_guard:
-  enabled: true
-  min_lio_features: 50
-  min_vio_features: 40
-  min_vio_inlier_ratio: 0.0
-  hold_after_rejects: 5
-  update_map_on_reject: true
-  max_position_update: 0.75       # m per measurement correction
-  max_rotation_update_deg: 5.0    # deg per measurement correction
-  max_speed: 2.0                  # m/s, matches flight envelope
-  step_margin: 0.05               # m timestamp/jitter allowance
-  max_tilt_deg: 20.0              # deg from initialized vehicle up
-
 local_map:
   map_sliding_en: false
   half_map_size: 100
