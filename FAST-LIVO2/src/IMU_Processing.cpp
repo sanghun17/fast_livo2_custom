@@ -12,10 +12,15 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 
+#include <stdexcept>
+
+// Timing uses omp_get_wtime() even when estimator parallelism is disabled.
+// Do not rely on Eigen's optional OpenMP header side effect for this symbol.
+#include <omp.h>
+
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
 {
-  init_iter_num = 1;
   cov_acc = V3D(0.1, 0.1, 0.1);
   cov_gyr = V3D(0.1, 0.1, 0.1);
   cov_bias_gyr = V3D(0.1, 0.1, 0.1);
@@ -29,6 +34,7 @@ ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
   Lid_rot_to_IMU = Eye3d;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  reset_imu_init_window();
 }
 
 ImuProcess::~ImuProcess() {}
@@ -36,12 +42,15 @@ ImuProcess::~ImuProcess() {}
 void ImuProcess::Reset()
 {
   ROS_WARN("Reset ImuProcess");
-  mean_acc = V3D(0, 0, -1.0);
-  mean_gyr = V3D(0, 0, 0);
+  reset_imu_init_window();
+  init_rejected_windows = 0;
+  init_invalid_samples = 0;
   angvel_last = Zero3d;
+  acc_s_last = Zero3d;
   last_prop_end_time = 0.0;
   imu_need_init = true;
-  init_iter_num = 1;
+  imu_time_init = false;
+  b_first_frame = true;
   IMUpose.clear();
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
@@ -100,53 +109,151 @@ void ImuProcess::set_inv_expo_cov(const double &inv_expo) { cov_inv_expo = inv_e
 
 void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
-void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
-
-void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
+void ImuProcess::set_imu_init_frame_num(const int &num)
 {
-  /** 1. initializing the gravity, gyro bias, acc and gyro covariance
-   ** 2. normalize the acceleration measurenments to unit gravity **/
-  ROS_INFO("IMU Initializing: %.1f %%", double(N) / MAX_INI_COUNT * 100);
-  V3D cur_acc, cur_gyr;
-
-  if (b_first_frame)
+  if (num < 2)
   {
-    Reset();
-    N = 1;
-    b_first_frame = false;
-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
-    mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
-    mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
-    // first_lidar_time = meas.lidar_frame_beg_time;
-    // cout<<"init acc norm: "<<mean_acc.norm()<<endl;
+    ROS_FATAL("IMU initialization requires at least 2 samples, got %d", num);
+    throw std::invalid_argument("imu/imu_int_frame must be >= 2");
   }
+  MAX_INI_COUNT = num;
+}
 
+void ImuProcess::set_imu_init_stationarity(const double max_gyr_mean,
+                                           const double max_gyr_std,
+                                           const double max_acc_std,
+                                           const double acc_norm_tolerance,
+                                           const bool estimate_gyr_bias)
+{
+  if (!std::isfinite(max_gyr_mean) || max_gyr_mean <= 0.0 ||
+      !std::isfinite(max_gyr_std) || max_gyr_std <= 0.0 ||
+      !std::isfinite(max_acc_std) || max_acc_std <= 0.0 ||
+      !std::isfinite(acc_norm_tolerance) || acc_norm_tolerance <= 0.0)
+  {
+    ROS_FATAL("Invalid IMU initialization stationarity limits: gyr_mean=%.6f gyr_std=%.6f "
+              "acc_std=%.6f acc_norm_tolerance=%.6f; every limit must be finite and positive",
+              max_gyr_mean, max_gyr_std, max_acc_std, acc_norm_tolerance);
+    throw std::invalid_argument("invalid IMU initialization stationarity limit");
+  }
+  init_max_gyr_mean = max_gyr_mean;
+  init_max_gyr_std = max_gyr_std;
+  init_max_acc_std = max_acc_std;
+  init_acc_norm_tolerance = acc_norm_tolerance;
+  init_estimate_gyr_bias = estimate_gyr_bias;
+}
+
+void ImuProcess::reset_imu_init_window()
+{
+  init_sample_count = 0;
+  mean_acc.setZero();
+  mean_gyr.setZero();
+  init_acc_m2.setZero();
+  init_gyr_m2.setZero();
+  init_first_stamp = std::numeric_limits<double>::quiet_NaN();
+  init_last_stamp = std::numeric_limits<double>::quiet_NaN();
+  init_first_seq = 0;
+  init_last_seq = 0;
+  init_selected_samples.clear();
+}
+
+bool ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout)
+{
+  /** Initialize gravity and gyro bias from exactly MAX_INI_COUNT valid,
+   * timestamp-ordered sensor samples.  The former implementation consumed an
+   * entire MeasureGroup and only checked the limit afterwards, so rosbag replay
+   * speed and callback batching changed both the sample count and the mean. **/
   for (const auto &imu : meas.imu)
   {
+    if (init_sample_count >= MAX_INI_COUNT) break;
+
+    const double stamp = imu->header.stamp.toSec();
     const auto &imu_acc = imu->linear_acceleration;
     const auto &gyr_acc = imu->angular_velocity;
-    cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
-    cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    const V3D cur_acc(imu_acc.x, imu_acc.y, imu_acc.z);
+    const V3D cur_gyr(gyr_acc.x, gyr_acc.y, gyr_acc.z);
 
-    mean_acc += (cur_acc - mean_acc) / N;
-    mean_gyr += (cur_gyr - mean_gyr) / N;
+    if (!std::isfinite(stamp) || stamp <= 0.0 || !cur_acc.allFinite() || !cur_gyr.allFinite())
+    {
+      ++init_invalid_samples;
+      ROS_WARN_THROTTLE(1.0, "IMU init: skipping non-finite sample (invalid total=%d)", init_invalid_samples);
+      continue;
+    }
+    if (std::isfinite(init_last_stamp) && stamp <= init_last_stamp)
+    {
+      ++init_invalid_samples;
+      ROS_WARN_THROTTLE(1.0,
+                        "IMU init: skipping non-increasing stamp %.9f after %.9f (invalid total=%d)",
+                        stamp, init_last_stamp, init_invalid_samples);
+      // Synchronization code may repeat the IMU sample at a MeasureGroup
+      // boundary.  Treat equal stamps as an already-counted duplicate instead
+      // of letting callback partitioning weight that sensor sample twice.
+      continue;
+    }
 
-    // cov_acc = cov_acc * (N - 1.0) / N + (cur_acc -
-    // mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N); cov_gyr
-    // = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr -
-    // mean_gyr) * (N - 1.0) / (N * N);
+    if (init_sample_count == 0)
+    {
+      init_first_stamp = stamp;
+      init_first_seq = imu->header.seq;
+    }
+    init_last_stamp = stamp;
+    init_last_seq = imu->header.seq;
+    init_selected_samples.emplace_back(
+        imu->header.stamp.toNSec(), imu->header.seq);
+    ++init_sample_count;
 
-    // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
+    const V3D acc_delta = cur_acc - mean_acc;
+    mean_acc += acc_delta / static_cast<double>(init_sample_count);
+    init_acc_m2 += acc_delta.cwiseProduct(cur_acc - mean_acc);
 
-    N++;
+    const V3D gyr_delta = cur_gyr - mean_gyr;
+    mean_gyr += gyr_delta / static_cast<double>(init_sample_count);
+    init_gyr_m2 += gyr_delta.cwiseProduct(cur_gyr - mean_gyr);
+
+    if (init_sample_count != MAX_INI_COUNT) continue;
+
+    const V3D acc_std = (init_acc_m2 / static_cast<double>(init_sample_count - 1)).cwiseMax(0.0).cwiseSqrt();
+    const V3D gyr_std = (init_gyr_m2 / static_cast<double>(init_sample_count - 1)).cwiseMax(0.0).cwiseSqrt();
+    const double acc_norm = mean_acc.norm();
+    const bool stationary =
+        mean_acc.allFinite() && mean_gyr.allFinite() && acc_std.allFinite() && gyr_std.allFinite() &&
+        std::abs(acc_norm - G_m_s2) <= init_acc_norm_tolerance &&
+        mean_gyr.norm() <= init_max_gyr_mean && gyr_std.norm() <= init_max_gyr_std &&
+        acc_std.norm() <= init_max_acc_std;
+
+    ROS_INFO("IMU init window: accepted=%s count=%d first=%.9f first_seq=%u "
+             "last=%.9f last_seq=%u duration=%.6f "
+             "acc_mean=[%.6f %.6f %.6f] acc_norm=%.6f acc_std=[%.6f %.6f %.6f] "
+             "gyr_mean=[%.6f %.6f %.6f] gyr_std=[%.6f %.6f %.6f]",
+             stationary ? "true" : "false", init_sample_count, init_first_stamp,
+             init_first_seq, init_last_stamp, init_last_seq,
+             init_last_stamp - init_first_stamp, mean_acc.x(), mean_acc.y(), mean_acc.z(), acc_norm,
+             acc_std.x(), acc_std.y(), acc_std.z(), mean_gyr.x(), mean_gyr.y(), mean_gyr.z(),
+             gyr_std.x(), gyr_std.y(), gyr_std.z());
+
+    if (!stationary)
+    {
+      ++init_rejected_windows;
+      ROS_ERROR("IMU init window rejected as non-stationary (rejected=%d): "
+                "limits gyr_mean<=%.3f gyr_std<=%.3f acc_std<=%.3f |acc_norm-g|<=%.3f",
+                init_rejected_windows, init_max_gyr_mean, init_max_gyr_std,
+                init_max_acc_std, init_acc_norm_tolerance);
+      reset_imu_init_window();
+      continue;
+    }
+
+    IMU_mean_acc_norm = acc_norm;
+    state_inout.gravity = -mean_acc / acc_norm * G_m_s2;
+    state_inout.rot_end = Eye3d;
+    state_inout.bias_g = init_estimate_gyr_bias ? mean_gyr : Zero3d;
+    last_imu = imu;
+    b_first_frame = false;
+    return true;
   }
-  IMU_mean_acc_norm = mean_acc.norm();
-  state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
-  state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  state_inout.bias_g = Zero3d; // mean_gyr;
 
-  last_imu = meas.imu.back();
+  ROS_INFO_THROTTLE(1.0, "IMU Initializing: %.1f %% (%d/%d valid samples)",
+                    100.0 * static_cast<double>(init_sample_count) / MAX_INI_COUNT,
+                    init_sample_count, MAX_INI_COUNT);
+  return false;
 }
 
 void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
@@ -541,7 +648,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // printf("[ IMU ] time forward: %lf, backward: %lf.\n", t1 - t0, omp_get_wtime() - t1);
 }
 
-void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_)
+void ImuProcess::Process2(
+    LidarMeasureGroup &lidar_meas, StatesGroup &stat,
+    PointCloudXYZI::Ptr cur_pcl_un_,
+    const deque<sensor_msgs::Imu::ConstPtr> *init_imu_samples)
 {
   double t1, t2, t3;
   t1 = omp_get_wtime();
@@ -559,27 +669,38 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     double pcl_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
     // lidar_meas.last_lio_update_time = pcl_end_time;
 
-    if (meas.imu.empty()) { return; };
-    /// The very first lidar frame
-    IMU_init(meas, stat, init_iter_num);
+    const deque<sensor_msgs::Imu::ConstPtr> &initialization_samples =
+        init_imu_samples == nullptr ? meas.imu : *init_imu_samples;
+    if (initialization_samples.empty()) { return; };
+    MeasureGroup initialization_meas = meas;
+    initialization_meas.imu = initialization_samples;
+    const bool initialized = IMU_init(initialization_meas, stat);
+    imu_need_init = !initialized;
 
-    imu_need_init = true;
+    // The estimator deliberately starts at this synchronized update epoch.
+    // Samples after the exact initialization window are assumed stationary and
+    // skipped, matching the historical behavior while making the statistics
+    // independent of callback batch size.
+    last_imu = meas.imu.empty() ? initialization_samples.back() : meas.imu.back();
 
-    last_imu = meas.imu.back();
-
-    if (init_iter_num > MAX_INI_COUNT)
+    if (initialized)
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
-      imu_need_init = false;
       // The first post-initialization propagation must start at the sensor
       // epoch represented by the final initialization frame.  Leaving this
       // unset made its first dt depend on uninitialized memory.
       last_prop_end_time = pcl_end_time;
-      ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
-               "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
-               stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],
+      // This state is defined at the synchronized LIO/image epoch, not at the
+      // stale first-LiDAR epoch carried while accumulating the init window.
+      // Downstream correction snapshots must use the same sensor epoch.
+      lidar_meas.last_lio_update_time = pcl_end_time;
+      ROS_INFO("IMU initialized: Gravity: %.4f %.4f %.4f %.4f; gyro bias: %.6f %.6f %.6f; acc covariance: "
+               "%.8f %.8f %.8f; gyro covariance: %.8f %.8f %.8f \n",
+               stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(),
+               stat.bias_g[0], stat.bias_g[1], stat.bias_g[2],
+               cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],
                cov_gyr[2]);
-      ROS_INFO("IMU Initials: ba covarience: %.8f %.8f %.8f; bg covarience: "
+      ROS_INFO("IMU initialized: ba covariance: %.8f %.8f %.8f; bg covariance: "
                "%.8f %.8f %.8f",
                cov_bias_acc[0], cov_bias_acc[1], cov_bias_acc[2], cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);

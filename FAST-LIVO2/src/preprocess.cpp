@@ -12,8 +12,22 @@ which is included as part of this source code package.
 
 #include "preprocess.h"
 
+// Timing uses omp_get_wtime() even in the deterministic single-thread build.
+#include <omp.h>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+template <typename PointT>
+inline bool hasFiniteXYZ(const PointT &point)
+{
+  return std::isfinite(static_cast<double>(point.x)) &&
+         std::isfinite(static_cast<double>(point.y)) &&
+         std::isfinite(static_cast<double>(point.z));
+}
+}  // namespace
 
 Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
 {
@@ -119,6 +133,7 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     {
       if ((msg->points[i].line < N_SCANS) && ((msg->points[i].tag & 0x30) == 0x10))
       {
+        if (!hasFiniteXYZ(msg->points[i])) continue;
         pl_full[i].x = msg->points[i].x;
         pl_full[i].y = msg->points[i].y;
         pl_full[i].z = msg->points[i].z;
@@ -126,8 +141,10 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points
 
         bool is_new = false;
-        if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7) ||
-            (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
+        if (!hasFiniteXYZ(msg->points[i - 1]) ||
+            (abs(msg->points[i].x - msg->points[i - 1].x) > 1e-7) ||
+            (abs(msg->points[i].y - msg->points[i - 1].y) > 1e-7) ||
+            (abs(msg->points[i].z - msg->points[i - 1].z) > 1e-7))
         {
           pl_buff[msg->points[i].line].push_back(pl_full[i]);
         }
@@ -163,10 +180,13 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
   }
   else
   {
+    float last_valid_curvature = 0.0f;
+    bool has_last_valid_curvature = false;
     for (uint i = 0; i < plsize; i++)
     {
       if ((msg->points[i].line < N_SCANS)) // && ((msg->points[i].tag & 0x30) == 0x10))
       {
+        if (!hasFiniteXYZ(msg->points[i])) continue;
         valid_num++;
 
         pl_full[i].x = msg->points[i].x;
@@ -175,15 +195,17 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         pl_full[i].intensity = msg->points[i].reflectivity;
         pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points
 
-        if (i == 0)
+        if (!has_last_valid_curvature)
           pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
         else
         {
-          // if(fabs(pl_full[i].curvature - pl_full[i - 1].curvature) > 1.0) ROS_ERROR("time jump: %f", fabs(pl_full[i].curvature - pl_full[i - 1].curvature));
-          pl_full[i].curvature = fabs(pl_full[i].curvature - pl_full[i - 1].curvature) < 1.0
+          // if(fabs(pl_full[i].curvature - last_valid_curvature) > 1.0) ROS_ERROR("time jump: %f", fabs(pl_full[i].curvature - last_valid_curvature));
+          pl_full[i].curvature = fabs(pl_full[i].curvature - last_valid_curvature) < 1.0
                                      ? pl_full[i].curvature
-                                     : pl_full[i - 1].curvature + 0.004166667f; // float(100/24000)
+                                     : last_valid_curvature + 0.004166667f; // float(100/24000)
         }
+        last_valid_curvature = pl_full[i].curvature;
+        has_last_valid_curvature = true;
 
         if (valid_num % point_filter_num == 0)
         {
@@ -217,6 +239,7 @@ void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   for (int i = 0; i < pl_orig.points.size(); i++)
   {
     if (i % point_filter_num != 0) continue;
+    if (!hasFiniteXYZ(pl_orig.points[i])) continue;
 
     double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y + pl_orig.points[i].z * pl_orig.points[i].z;
 
@@ -260,6 +283,7 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
     for (uint i = 0; i < plsize; i++)
     {
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
       double range =
           pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y + pl_orig.points[i].z * pl_orig.points[i].z;
       if (range < blind_sqr) continue;
@@ -284,6 +308,7 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     {
       PointCloudXYZI &pl = pl_buff[j];
       int linesize = pl.size();
+      if (linesize < 2) continue;
       vector<orgtype> &types = typess[j];
       types.clear();
       types.resize(linesize);
@@ -308,6 +333,7 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     for (int i = 0; i < pl_orig.points.size(); i++)
     {
       if (i % point_filter_num != 0) continue;
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
 
       double range =
           pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y + pl_orig.points[i].z * pl_orig.points[i].z;
@@ -389,6 +415,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
     for (int i = 0; i < plsize; i++)
     {
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
       PointType added_pt;
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
@@ -452,6 +479,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   {
     for (int i = 0; i < plsize; i++)
     {
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
       PointType added_pt;
       // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
 
@@ -520,9 +548,12 @@ void Preprocess::Pandar128_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
   int plsize = pl_orig.points.size();
   pl_surf.reserve(plsize);
 
+  if (plsize == 0) return;
+
   double time_head = pl_orig.points[0].timestamp;
   for (int i = 0; i < plsize; i++)
   {
+    if (!hasFiniteXYZ(pl_orig.points[i])) continue;
     PointType added_pt;
 
     added_pt.normal_x = 0;
@@ -574,6 +605,8 @@ void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   int plsize = pl_orig.points.size();
   pl_surf.reserve(plsize);
 
+  if (plsize == 0) return;
+
   bool is_first[MAX_LINE_NUM];
   double yaw_fp[MAX_LINE_NUM] = {0};     // yaw of first scan point
   double omega_l = 3.61;                 // scan angular velocity
@@ -610,6 +643,7 @@ void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
     for (int i = 0; i < plsize; i++)
     {
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
       PointType added_pt;
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
@@ -673,6 +707,7 @@ void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   {
     for (int i = 0; i < plsize; i++)
     {
+      if (!hasFiniteXYZ(pl_orig.points[i])) continue;
       PointType added_pt;
       // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
 
@@ -716,6 +751,8 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
   int plsize = pl_orig.size();
   pl_surf.reserve(plsize);
 
+  if (plsize == 0) return;
+
   double time_head = pl_orig.points[0].timestamp;
   for (int i = 0; i < plsize; ++i)
   {
@@ -724,7 +761,7 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
     const auto& pt = pl_orig.points[i];
     const double x = pt.x, y = pt.y, z = pt.z;
     const double dist_sqr = x * x + y * y + z * z;
-    const bool is_valid = (dist_sqr >= blind_sqr) && !std::isnan(x) && !std::isnan(y) && !std::isnan(z);
+    const bool is_valid = (dist_sqr >= blind_sqr) && hasFiniteXYZ(pt);
     if (!is_valid) continue;
 
     PointType added_pt;
@@ -754,10 +791,11 @@ void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &t
   }
   uint head = 0;
 
-  while (types[head].range < blind_sqr)
+  while (head < types.size() && types[head].range < blind_sqr)
   {
     head++;
   }
+  if (head == types.size()) return;
 
   // Surf
   plsize2 = (plsize > group_size) ? (plsize - group_size) : 0;

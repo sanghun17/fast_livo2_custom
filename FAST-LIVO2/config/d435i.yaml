@@ -15,6 +15,17 @@ common:
   online_intrinsics_en: true
   cam_info_topic: "/camera/color/camera_info"
   cam_info_timeout: 5.0
+  # Preserve frames whose callback beats the first point cloud; sensor-time
+  # synchronization decides whether they are usable. Queue remains bounded.
+  img_input_queue_max: 64
+
+# Read-only diagnostics for offline visual-quality analysis.  Keep disabled in
+# flight: enabling it writes every processed image frame and active visual patch
+# to <prefix>_{frames,points}.csv and adds disk/eigendecomposition overhead.
+debug:
+  visual_quality_log: false
+  visual_quality_output_prefix: "/tmp/fast_livo_visual_quality"
+  visual_quality_flush_every_n_frames: 10
 
 # ===========================================================================
 # Intel RealSense D435i  (serial 923322070596) on Jetson Orin AGX
@@ -34,15 +45,13 @@ extrin_calib:
   # precision, rotation identity. Factory model-constant lever arm.
   extrinsic_T: [0.00552, -0.0051, -0.01174]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  # Color->Depth (Rcl/Pcl). From rs-enumerate-devices -c "Color To Depth" on
-  # S/N 923322070596 (2026-06-22). The inverse (Depth->Color) was
-  #   R = [0.999978, 0.00659742, 0.00021399, -0.00659736, 0.999978, -0.000301692,
-  #        -0.000215976, 0.000300274, 1],  t = [0.01438551, 9.43e-05, 0.00042120]
-  #   (baseline 14.4mm). Rcl/Pcl below ARE that "Color To Depth" block verbatim.
-  Rcl: [0.999978,   -0.00659736, -0.000215976,
-        0.00659742,  0.999978,    0.000300274,
-        0.00021399, -0.000301692, 1.0]
-  Pcl: [-0.0143844867125154, -0.000189328260603361, -0.000424247875344008]
+  # Depth->Color is required by FAST-LIVO's p_color=Rcl*p_depth+Pcl
+  # projection convention. These are the inverse of the factory
+  # Color->Depth block and match the accepted multi-flight replay config.
+  Rcl: [0.999978, 0.00659742, 0.00021399,
+        -0.00659736, 0.999978, -0.000301692,
+        -0.000215976, 0.000300274, 1.0]
+  Pcl: [0.01438551, 0.0000943, 0.00042120]
 
 # Body(=marker) hand-eye extrinsic for /aft_mapped_to_body (mux vio input) + /aft_mapped_to_optitrack.
 # T_cam2body: p_body = R*p_cam + t  (OpenCV cam2gripper; gripper = OptiTrack 'pure' rigid body rigidly
@@ -53,6 +62,11 @@ body_calib:
   q_cam2body_xyzw: [0.4947, -0.5015, 0.5079, -0.4957]
   t_cam2body: [0.07685, 0.02273, 0.03045]
   gt_avg_sec: 3.0          # average GT over this many sec (startup still window) to latch the optitrack anchor
+
+mocap:
+  # Evaluation output only. VIO-local control/planning topics are invariant to
+  # this switch; flight candidates override it false for GT isolation.
+  anchor_enable: true
 
 # ===========================================================================
 # TUNED 2026-06-24 on ml via tools/fastlivo parallel grid (v5..v8, 954 configs,
@@ -96,7 +110,33 @@ vio:
 
 imu:
   imu_en: true
+  # Bounds sensor-time IMUs retained while waiting for the first LiDAR/image or
+  # while the estimator is temporarily backlogged (~20 s at 200 Hz).  Startup
+  # samples are not discarded merely because their callback beats LiDAR TCP.
+  input_queue_max: 4096
+  # Independent bounded copy used only until gravity initialization completes.
+  # It prevents the normal synchronizer's callback-sized MeasureGroups from
+  # choosing a different first sample. Overflow is fatal; samples never slide.
+  init_queue_max: 4096
+  # Explicit-anchor replay must receive an IMU immediately before the anchor;
+  # this guards against accepting a startup prefix with a silently lost tail.
+  init_anchor_max_predecessor_gap_s: 0.02
+  # Empty in live flight: latch the first image/LiDAR/IMU full-sync sensor epoch.
+  # Offline harnesses set this to a decimal uint64 nanosecond string, avoiding
+  # XML-RPC's 32-bit integer limit and floating-point epoch rounding.
+  init_anchor_stamp_ns: ""
+  # Exact count of finite, strictly timestamp-ordered samples used for the
+  # startup gravity/gyro-bias estimate (30 samples ~=0.15 s at 200 Hz).
+  # Callback batching no longer changes this count.  A rejected moving window
+  # is reported and the estimator waits for the next stationary window.
   imu_int_frame: 30
+  init_max_gyr_mean: 0.30        # rad/s, norm of the window mean
+  init_max_gyr_std: 0.25         # rad/s, norm of per-axis sample stddev
+  init_max_acc_std: 1.50         # m/s^2, norm of per-axis sample stddev
+  init_acc_norm_tolerance: 3.00  # m/s^2, allowed |mean(acc)| difference from g
+  # Keep the historical zero-bias startup for baseline parity.  Mean-gyro bias
+  # estimation is only safe to A/B with a longer, known pre-arm static window.
+  init_estimate_gyr_bias: false
   # Initial values - need Allan variance calibration
   acc_cov: 0.1           # TUNED (was 0.5): low IMU-trust (imu=lo) best across grid
   gyr_cov: 0.1           # TUNED (was 0.3)
@@ -123,7 +163,17 @@ local_map:
   sliding_thresh: 8
 
 uav:
-  imu_rate_odom: true   # /aft_mapped_to_body_imu_propagated (Odometry+twist, 250Hz) = planning_odom_mux vio source
+  imu_rate_odom: true   # measured best-effort ~60-70Hz, planning_odom_mux VIO source
+  # The high-rate publisher drains every queued 200 Hz IMU timestamp exactly
+  # once. A larger gap invalidates propagation until the next LIO/VIO correction
+  # instead of integrating one stale measurement over an unsafe interval.
+  imu_prop_max_dt: 0.05
+  imu_prop_queue_max: 4096
+  imu_prop_correction_queue_max: 256
+  # The historical /livo/reinit callback does not atomically clear every map,
+  # sensor and propagation buffer.  A ground hard restart is the only supported
+  # reset until that contract is rewritten and flight-tested.
+  runtime_reinit_enable: false
   gravity_align_en: false  # TUNED (was true): grid best (ga0) = 0.093m vs ga1 0.123m on the test bag.
   # ⚠️ FLIGHT CAVEAT: gravity_align=true was set 2026-06-22 to fix takeoff climb scale (0.74->0.93,
   # accel constrains vertical). The bag-best turns it OFF, but that bag may not stress takeoff climb.

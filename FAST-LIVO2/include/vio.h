@@ -15,6 +15,7 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 #include "feature.h"
+#include <cstdint>
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
@@ -119,6 +120,16 @@ public:
   int frame_count = 0;
   bool plot_flag;
   bool verbose = false;   // gate per-frame VIO console spam (injected from LIVMapper debug/verbose)
+  // Debug-only visual measurement diagnostics.  Disabled by default; when
+  // enabled, every processed image frame and every active sparse-map patch is
+  // written to two CSV files.  The logger only evaluates the already-finalized
+  // state and never changes the estimator update or feature selection.
+  bool visual_quality_log_enabled = false;
+  std::string visual_quality_output_prefix = "/tmp/fast_livo_visual_quality";
+  int visual_quality_flush_every_n_frames = 10;
+  std::uint64_t visual_quality_frame_index = 0;
+  std::ofstream visual_quality_frames_stream;
+  std::ofstream visual_quality_points_stream;
   bool flip_roll = false, flip_pitch = false;   // debug: negate VIO roll/pitch update component (test sign hypothesis)
   // When false, keep tracking/reference-map maintenance active but skip the
   // visual EKF correction for this frame.  LIVMapper drives this from the
@@ -130,6 +141,9 @@ public:
   double last_translation_info_ratio = 0.0;
   double last_rotation_info_ratio = 0.0;
   double last_info_min_per_measurement = 0.0;
+  Eigen::Matrix<double, 7, 7> visual_quality_prior_state_cov =
+      Eigen::Matrix<double, 7, 7>::Zero();
+  StatesGroup visual_quality_prior_state;
 
   Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;
@@ -154,7 +168,9 @@ public:
   ~VIOManager();
   void updateStateInverse(cv::Mat img, int level);
   void updateState(cv::Mat img, int level);
-  void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
+  void processFrame(cv::Mat &img, vector<pointWithVar> &pg,
+                    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
+                    double img_time_s, double img_rel_s);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
@@ -182,6 +198,8 @@ public:
   double calculateNCC(float *ref_patch, float *cur_patch, int patch_size);
   int getBestSearchLevel(const Matrix2d &A_cur_ref, const int max_level);
   V3F getInterpolatedPixel(cv::Mat img, V2D pc);
+  bool ensureVisualQualityLogOpen();
+  void logVisualQualityFrame(const cv::Mat &img, double img_time_s, double img_rel_s);
   
   // void resetRvizDisplay();
   // deque<VisualPoint *> map_cur_frame;

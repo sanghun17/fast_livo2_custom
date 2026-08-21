@@ -15,6 +15,14 @@ which is included as part of this source code package.
 #include <ros/topic.h>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <iomanip>
+#include <openssl/sha.h>
+#include <sstream>
+#include <type_traits>
+#include <vector>
 
 namespace {
 // Pick the vikit camera model from a distortion-model string and build it.
@@ -47,6 +55,78 @@ bool buildCameraFromInfo(const sensor_msgs::CameraInfo &ci, double scale, vk::Ab
                   << "  D=[" << D(0) << ", " << D(1) << ", " << D(2) << ", " << D(3) << "]");
   return true;
 }
+
+std::uint64_t sensorSecondsToNanoseconds(const double seconds)
+{
+  if (!std::isfinite(seconds) || seconds <= 0.0) return 0;
+  ros::Time stamp;
+  stamp.fromSec(seconds);
+  return stamp.toNSec();
+}
+
+std::string sha256Hex(const void *data, const std::size_t size)
+{
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char *>(data), size, digest);
+  std::ostringstream hex;
+  hex << std::hex << std::setfill('0');
+  for (const unsigned char byte : digest)
+    hex << std::setw(2) << static_cast<unsigned int>(byte);
+  return hex.str();
+}
+
+std::string selectedImuVectorSha256(
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>> &samples)
+{
+  // Text is deliberate here: it is a portable, human-reconstructible
+  // canonical representation of the original ROS uint64 stamp and uint32 seq.
+  std::ostringstream canonical;
+  for (const auto &sample : samples)
+    canonical << sample.first << ',' << sample.second << '\n';
+  const std::string payload = canonical.str();
+  return sha256Hex(payload.data(), payload.size());
+}
+
+void appendBinary64BigEndian(std::vector<unsigned char> &payload,
+                             const double value)
+{
+  static_assert(sizeof(double) == sizeof(std::uint64_t),
+                "initial-state fingerprint requires binary64 double");
+  static_assert(std::numeric_limits<double>::is_iec559,
+                "initial-state fingerprint requires IEEE-754 double");
+  std::uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  for (int shift = 56; shift >= 0; shift -= 8)
+    payload.push_back(static_cast<unsigned char>((bits >> shift) & 0xffU));
+}
+
+std::string initialStateSha256(const StatesGroup &state)
+{
+  // Schema fast_livo/initial_state_ieee754_be/v1:
+  // rot_end row-major (9), pos_end (3), vel_end (3), inv_expo_time (1),
+  // bias_g (3), bias_a (3), gravity (3), cov row-major (19x19).
+  std::vector<unsigned char> payload;
+  payload.reserve((9 + 3 + 3 + 1 + 3 + 3 + 3 +
+                   DIM_STATE * DIM_STATE) * sizeof(double));
+  for (int row = 0; row < 3; ++row)
+    for (int column = 0; column < 3; ++column)
+      appendBinary64BigEndian(payload, state.rot_end(row, column));
+  for (int index = 0; index < 3; ++index)
+    appendBinary64BigEndian(payload, state.pos_end(index));
+  for (int index = 0; index < 3; ++index)
+    appendBinary64BigEndian(payload, state.vel_end(index));
+  appendBinary64BigEndian(payload, state.inv_expo_time);
+  for (int index = 0; index < 3; ++index)
+    appendBinary64BigEndian(payload, state.bias_g(index));
+  for (int index = 0; index < 3; ++index)
+    appendBinary64BigEndian(payload, state.bias_a(index));
+  for (int index = 0; index < 3; ++index)
+    appendBinary64BigEndian(payload, state.gravity(index));
+  for (int row = 0; row < DIM_STATE; ++row)
+    for (int column = 0; column < DIM_STATE; ++column)
+      appendBinary64BigEndian(payload, state.cov(row, column));
+  return sha256Hex(payload.data(), payload.size());
+}
 } // namespace
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
@@ -62,6 +142,33 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   p_imu.reset(new ImuProcess());
 
   readParameters(nh);
+  imu_init_buffer.reset(new ImuInitSampleBuffer(
+      static_cast<std::size_t>(imu_init_queue_max),
+      static_cast<std::uint64_t>(std::llround(
+          imu_init_anchor_max_predecessor_gap_s * 1e9))));
+  if (!imu_init_anchor_stamp_ns_param.empty())
+  {
+    const std::uint64_t anchor_stamp_ns =
+        fast_livo::parsePositiveNanoseconds(imu_init_anchor_stamp_ns_param);
+    if (!imu_init_buffer->setExplicitAnchor(anchor_stamp_ns))
+      throw std::invalid_argument(imu_init_buffer->failureReason());
+    imu_init_anchor_explicit = true;
+    ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+             "\"status\":\"configured\",\"anchor_mode\":\"explicit\","
+             "\"anchor_stamp_ns\":\"%llu\",\"queue_max\":%d,"
+             "\"anchor_max_predecessor_gap_ns\":\"%llu\"}",
+             static_cast<unsigned long long>(anchor_stamp_ns),
+             imu_init_queue_max,
+             static_cast<unsigned long long>(std::llround(
+                 imu_init_anchor_max_predecessor_gap_s * 1e9)));
+  }
+  else
+  {
+    ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+             "\"status\":\"configured\",\"anchor_mode\":\"live_first_full_sync\","
+             "\"anchor_stamp_ns\":null,\"queue_max\":%d}",
+             imu_init_queue_max);
+  }
   VoxelMapConfig voxel_config;
   loadVoxelConfig(nh, voxel_config);
 
@@ -82,7 +189,45 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   path.header.frame_id = "camera_init";
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper()
+{
+  std::lock_guard<std::mutex> lock(mtx_buffer_imu_prop);
+  ROS_INFO("[imu_prop] summary: input=%zu pending=%zu history=%zu corrections=%zu "
+           "input_high_water=%zu pre_lidar=%llu input_drops=%llu "
+           "high_water=[%zu %zu %zu] invalid=%llu nonmonotonic=%llu gaps=%llu "
+           "queue_drops=%llu history_drops=%llu correction_drops=%llu superseded=%llu",
+           imu_buffer.size(), prop_imu_buffer.size(), prop_imu_history.size(),
+           prop_correction_buffer.size(), imu_input_high_water,
+           static_cast<unsigned long long>(imu_pre_lidar_sample_count),
+           static_cast<unsigned long long>(imu_input_queue_drop_count),
+           imu_prop_pending_high_water,
+           imu_prop_history_high_water, imu_prop_correction_high_water,
+           static_cast<unsigned long long>(imu_prop_invalid_sample_count),
+           static_cast<unsigned long long>(imu_prop_nonmonotonic_count),
+           static_cast<unsigned long long>(imu_prop_gap_count),
+           static_cast<unsigned long long>(imu_prop_queue_drop_count),
+           static_cast<unsigned long long>(imu_prop_history_drop_count),
+           static_cast<unsigned long long>(imu_prop_correction_drop_count),
+           static_cast<unsigned long long>(imu_prop_superseded_count));
+  ROS_INFO("[image_input] summary: queued=%zu high_water=%zu pre_lidar=%llu drops=%llu",
+           img_buffer.size(), img_input_high_water,
+           static_cast<unsigned long long>(img_pre_lidar_frame_count),
+           static_cast<unsigned long long>(img_input_queue_drop_count));
+  if (imu_init_buffer)
+  {
+    const char *status = imu_init_accepted_logged ? "accepted" :
+                         imu_init_failed ? "failed" : "incomplete";
+    ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+             "\"status\":\"%s\",\"anchor_mode\":\"%s\","
+             "\"anchor_stamp_ns\":\"%llu\",\"queued\":%zu,"
+             "\"high_water\":%zu,\"drops\":%llu,\"emitted\":%llu}",
+             status, imu_init_anchor_explicit ? "explicit" : "live_first_full_sync",
+             static_cast<unsigned long long>(imu_init_buffer->anchorStampNs()),
+             imu_init_buffer->size(), imu_init_buffer->highWater(),
+             static_cast<unsigned long long>(imu_init_buffer->dropCount()),
+             static_cast<unsigned long long>(imu_init_buffer->emittedCount()));
+  }
+}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
@@ -95,6 +240,12 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("debug/fusion_log", fusion_debug, false);        // debug-only: log per-frame IMU-prop vs post-LIO/VIO attitude to /tmp/fusion_debug.csv
   nh.param<bool>("debug/vio_flip_roll", vio_flip_roll, false);    // debug-only: negate the VIO roll state update
   nh.param<bool>("debug/vio_flip_pitch", vio_flip_pitch, false);  // debug-only: negate the VIO pitch state update
+  nh.param<bool>("debug/visual_quality_log", visual_quality_log, false);
+  nh.param<string>("debug/visual_quality_output_prefix",
+                   visual_quality_output_prefix,
+                   "/tmp/fast_livo_visual_quality");
+  nh.param<int>("debug/visual_quality_flush_every_n_frames",
+                visual_quality_flush_every_n_frames, 10);
   // -1 preserves upstream always-on fusion.  A non-negative value enables a
   // sensor-health fallback: VIO corrects the state only when the immediately
   // preceding LIO update has at most this many effective point-plane features.
@@ -105,10 +256,13 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<string>("common/cam_info_topic", cam_info_topic, "");
   nh.param<double>("common/cam_info_timeout", cam_info_timeout, 5.0);
   nh.param<string>("common/cam_calib_file", cam_calib_file, "");
+  nh.param<int>("common/img_input_queue_max", img_input_queue_max, 64);
 
   // OptiTrack/mocap gt-init: the first pose on this topic latches odom->camera_init
   // (gt_odom_cbk). Always subscribed; self-activates when mocap is publishing.
   nh.param<string>("mocap/gt_pose_topic", gt_pose_topic, "/vrpn_client_node/pure/pose");
+  nh.param<bool>("mocap/anchor_enable", mocap_anchor_enable, true);
+  nh.param<bool>("uav/runtime_reinit_enable", runtime_reinit_enable, false);
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -128,7 +282,27 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("time_offset/imu_time_offset", imu_time_offset, 0.0);
   nh.param<double>("time_offset/lidar_time_offset", lidar_time_offset, 0.0);
   nh.param<bool>("uav/imu_rate_odom", imu_prop_enable, false);
+  nh.param<int>("imu/input_queue_max", imu_input_queue_max, 4096);
+  nh.param<int>("imu/init_queue_max", imu_init_queue_max, 4096);
+  nh.param<double>("imu/init_anchor_max_predecessor_gap_s",
+                   imu_init_anchor_max_predecessor_gap_s, 0.02);
+  nh.param<string>("imu/init_anchor_stamp_ns",
+                   imu_init_anchor_stamp_ns_param, "");
+  nh.param<double>("uav/imu_prop_max_dt", imu_prop_max_dt, 0.05);
+  nh.param<int>("uav/imu_prop_queue_max", imu_prop_queue_max, 4096);
+  nh.param<int>("uav/imu_prop_correction_queue_max", imu_prop_correction_queue_max, 256);
   nh.param<bool>("uav/gravity_align_en", gravity_align_en, false);
+  if (!std::isfinite(imu_prop_max_dt) || imu_prop_max_dt <= 0.0 ||
+      imu_prop_max_dt > 0.5 || imu_input_queue_max < 2 ||
+      img_input_queue_max < 2 ||
+      imu_prop_queue_max < 2 ||
+      imu_prop_correction_queue_max < 2)
+  {
+    ROS_FATAL("Invalid sensor queue/IMU propagation bounds: input_queue=%d image_queue=%d max_dt=%.6f queue=%d correction_queue=%d",
+              imu_input_queue_max, img_input_queue_max, imu_prop_max_dt, imu_prop_queue_max,
+              imu_prop_correction_queue_max);
+    throw std::invalid_argument("invalid IMU queue/propagation bounds");
+  }
 
   nh.param<string>("evo/seq_name", seq_name, "01");
   nh.param<bool>("evo/pose_output_en", pose_output_en, false);
@@ -137,9 +311,29 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("imu/b_gyr_cov", b_gyr_cov, 0.0001);
   nh.param<double>("imu/b_acc_cov", b_acc_cov, 0.0001);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
+  nh.param<double>("imu/init_max_gyr_mean", imu_init_max_gyr_mean, 0.30);
+  nh.param<double>("imu/init_max_gyr_std", imu_init_max_gyr_std, 0.25);
+  nh.param<double>("imu/init_max_acc_std", imu_init_max_acc_std, 1.50);
+  nh.param<double>("imu/init_acc_norm_tolerance", imu_init_acc_norm_tolerance, 3.00);
+  nh.param<bool>("imu/init_estimate_gyr_bias", imu_init_estimate_gyr_bias, false);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
+  if (imu_init_queue_max < imu_int_frame + 1 ||
+      !std::isfinite(imu_init_anchor_max_predecessor_gap_s) ||
+      imu_init_anchor_max_predecessor_gap_s <= 0.0 ||
+      imu_init_anchor_max_predecessor_gap_s > 0.5)
+  {
+    ROS_FATAL("Invalid IMU initialization bounds: init_queue=%d target+1=%d anchor_predecessor_gap=%.9f",
+              imu_init_queue_max, imu_int_frame + 1,
+              imu_init_anchor_max_predecessor_gap_s);
+    throw std::invalid_argument("invalid IMU initialization bounds");
+  }
+  if (!imu_init_anchor_stamp_ns_param.empty() && runtime_reinit_enable)
+  {
+    ROS_FATAL("Explicit IMU initialization anchor is incompatible with runtime reinit");
+    throw std::invalid_argument("explicit IMU init anchor with runtime reinit");
+  }
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
@@ -163,14 +357,23 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
     vector<double> qcb, tcb;
     nh.param<vector<double>>("body_calib/q_cam2body_xyzw", qcb, vector<double>());
     nh.param<vector<double>>("body_calib/t_cam2body", tcb, vector<double>());
-    if (body_calib_en && qcb.size() == 4 && tcb.size() == 3) {
-      Eigen::Quaterniond q(qcb[3], qcb[0], qcb[1], qcb[2]); q.normalize();
+    if (body_calib_en) {
+      if (qcb.size() != 4 || tcb.size() != 3)
+        throw std::runtime_error(
+            "body_calib enabled but q_cam2body_xyzw/t_cam2body has wrong size");
+      for (double value : qcb)
+        if (!std::isfinite(value))
+          throw std::runtime_error("body_calib quaternion contains NaN/Inf");
+      for (double value : tcb)
+        if (!std::isfinite(value))
+          throw std::runtime_error("body_calib translation contains NaN/Inf");
+      Eigen::Quaterniond q(qcb[3], qcb[0], qcb[1], qcb[2]);
+      if (q.norm() < 1e-9)
+        throw std::runtime_error("body_calib quaternion has zero norm");
+      q.normalize();
       R_cam2body = q.toRotationMatrix();
       t_cam2body << tcb[0], tcb[1], tcb[2];
       ROS_INFO("[body_calib] enabled: t_cam2body=[%.4f %.4f %.4f] m", tcb[0], tcb[1], tcb[2]);
-    } else if (body_calib_en) {
-      ROS_WARN("[body_calib] enable=true but q/t params missing/wrong size -> DISABLED");
-      body_calib_en = false;
     }
   }
   nh.param<double>("debug/plot_time", plot_time, -10);
@@ -187,9 +390,36 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
 void LIVMapper::initializeComponents() 
 {
+  auto require_finite_vector = [](const std::vector<double> &values,
+                                  std::size_t expected,
+                                  const char *name) {
+    if (values.size() != expected)
+      throw std::runtime_error(std::string(name) + " must contain exactly " +
+                               std::to_string(expected) + " finite values");
+    for (double value : values)
+      if (!std::isfinite(value))
+        throw std::runtime_error(std::string(name) + " contains NaN/Inf");
+  };
+  require_finite_vector(extrinT, 3, "extrin_calib/extrinsic_T");
+  require_finite_vector(extrinR, 9, "extrin_calib/extrinsic_R");
+  require_finite_vector(cameraextrinT, 3, "extrin_calib/Pcl");
+  require_finite_vector(cameraextrinR, 9, "extrin_calib/Rcl");
+
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
   extT << VEC_FROM_ARRAY(extrinT);
   extR << MAT_FROM_ARRAY(extrinR);
+  Eigen::Matrix3d Rcl;
+  Rcl << MAT_FROM_ARRAY(cameraextrinR);
+  auto require_rotation = [](const Eigen::Matrix3d &rotation, const char *name) {
+    const double orthogonality_error =
+        (rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).norm();
+    if (!rotation.allFinite() || std::abs(rotation.determinant() - 1.0) > 1e-3 ||
+        orthogonality_error > 1e-3)
+      throw std::runtime_error(std::string(name) +
+                               " is not a finite proper rotation matrix");
+  };
+  require_rotation(extR, "extrin_calib/extrinsic_R");
+  require_rotation(Rcl, "extrin_calib/Rcl");
 
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
@@ -235,6 +465,14 @@ void LIVMapper::initializeComponents()
   vio_manager->verbose = verbose;
   vio_manager->flip_roll = vio_flip_roll;
   vio_manager->flip_pitch = vio_flip_pitch;
+  vio_manager->visual_quality_log_enabled = visual_quality_log;
+  vio_manager->visual_quality_output_prefix = visual_quality_output_prefix;
+  vio_manager->visual_quality_flush_every_n_frames =
+      std::max(1, visual_quality_flush_every_n_frames);
+  ROS_INFO_STREAM("[VIO quality] init requested=" << std::boolalpha
+                  << visual_quality_log << " manager_enabled="
+                  << vio_manager->visual_quality_log_enabled << " prefix='"
+                  << vio_manager->visual_quality_output_prefix << "'");
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
   vio_manager->outlier_threshold = outlier_threshold;
@@ -261,6 +499,9 @@ void LIVMapper::initializeComponents()
   p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
   p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->set_imu_init_stationarity(
+      imu_init_max_gyr_mean, imu_init_max_gyr_std, imu_init_max_acc_std,
+      imu_init_acc_norm_tolerance, imu_init_estimate_gyr_bias);
 
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();
@@ -303,12 +544,20 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh)
             nh.subscribe(lid_topic, 10, &LIVMapper::standard_pcl_cbk, this);  // [jetson] was 200000: tiny queue drops stale clouds under CPU load instead of buffering -> instant recovery after a stall (no slow backlog grind). See mapping_d435i.launch launch-prefix.
   sub_imu = nh.subscribe(imu_topic, 2000, &LIVMapper::imu_cbk, this);  // [jetson] was 200000: keep ~10s of IMU (cheap to drain, avoids propagation gaps) but bounded.
   sub_img = nh.subscribe(img_topic, 10, &LIVMapper::img_cbk, this);  // [jetson] was 200000: small queue, drop stale frames under load.
-  sub_reinit = nh.subscribe("/livo/reinit", 1, &LIVMapper::reinit_cbk, this);  // re-anchor trigger
-  // Always subscribe (like sim `ml`): the first pose that arrives latches odom->camera_init
-  // (gt_odom_cbk), used by the imu_prop odom path; body_calib also buffers GT here to anchor
-  // /aft_mapped_to_optitrack. Self-selects at runtime — no enable flag.
-  sub_gt_odom = nh.subscribe(gt_pose_topic, 1, &LIVMapper::gt_odom_cbk, this);
-  ROS_INFO("[mocap] gt-init armed: first pose on %s sets odom->camera_init", gt_pose_topic.c_str());
+  if (runtime_reinit_enable) {
+    sub_reinit = nh.subscribe("/livo/reinit", 1, &LIVMapper::reinit_cbk, this);
+    ROS_WARN("[reinit] runtime reset enabled; this path is experimental and must not be used while armed");
+  } else {
+    ROS_INFO("[reinit] runtime reset disabled; use a ground hard restart instead");
+  }
+  // Mocap is evaluation-only. It may create /aft_mapped_to_optitrack, but it
+  // must never alter either VIO-local control/planning output.
+  if (mocap_anchor_enable) {
+    sub_gt_odom = nh.subscribe(gt_pose_topic, 1, &LIVMapper::gt_odom_cbk, this);
+    ROS_INFO("[mocap] evaluation anchor enabled on %s", gt_pose_topic.c_str());
+  } else {
+    ROS_INFO("[mocap] evaluation anchor disabled; estimator is GT-isolated");
+  }
 
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -334,6 +583,10 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh)
   // does not advertise inapplicable depth transports.
   pubImage = nh.advertise<sensor_msgs::Image>("/rgb_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_body_imu_propagated", 10000);
+  pubImuPropWorldTwist = nh.advertise<geometry_msgs::TwistStamped>(
+      "/aft_mapped_to_body_imu_propagated_world_twist", 10000);
+  pubCorrectionPoseCov = nh.advertise<geometry_msgs::PoseWithCovarianceStamped>(
+      "/aft_mapped_to_body_correction_pose_cov", 100);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
 }
@@ -367,11 +620,219 @@ void LIVMapper::gravityAlignment()
   }
 }
 
+void LIVMapper::maybeLatchLiveImuInitAnchor(
+    const double synchronized_epoch, const double lidar_watermark,
+    const double image_epoch)
+{
+  if (!imu_init_buffer || !p_imu->imu_need_init || imu_init_failed) return;
+
+  const std::uint64_t synchronized_epoch_ns =
+      sensorSecondsToNanoseconds(synchronized_epoch);
+  if (synchronized_epoch_ns == 0)
+  {
+    failImuInitialization("invalid synchronized sensor epoch");
+    return;
+  }
+
+  if (imu_init_anchor_explicit)
+  {
+    if (imu_init_anchor_image_epoch_ns == 0 &&
+        synchronized_epoch_ns > imu_init_buffer->anchorStampNs())
+    {
+      failImuInitialization(
+          "explicit anchor was not observed as a full-sync sensor epoch",
+          synchronized_epoch_ns);
+      return;
+    }
+    if (imu_init_anchor_image_epoch_ns == 0 &&
+        synchronized_epoch_ns == imu_init_buffer->anchorStampNs())
+    {
+      imu_init_anchor_lidar_watermark_ns =
+          sensorSecondsToNanoseconds(lidar_watermark);
+      imu_init_anchor_image_epoch_ns =
+          sensorSecondsToNanoseconds(image_epoch);
+      imu_init_anchor_imu_watermark_ns =
+          sensorSecondsToNanoseconds(last_timestamp_imu);
+      ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+               "\"status\":\"anchor_covered\",\"anchor_mode\":\"explicit\","
+               "\"anchor_stamp_ns\":\"%llu\",\"sync_epoch_ns\":\"%llu\","
+               "\"lidar_watermark_ns\":\"%llu\",\"image_epoch_ns\":\"%llu\","
+               "\"imu_watermark_ns\":\"%llu\",\"has_pre_anchor_imu\":%s,"
+               "\"anchor_predecessor_stamp_ns\":\"%llu\","
+               "\"anchor_predecessor_gap_ns\":\"%llu\"}",
+               static_cast<unsigned long long>(imu_init_buffer->anchorStampNs()),
+               static_cast<unsigned long long>(synchronized_epoch_ns),
+               static_cast<unsigned long long>(imu_init_anchor_lidar_watermark_ns),
+               static_cast<unsigned long long>(imu_init_anchor_image_epoch_ns),
+               static_cast<unsigned long long>(imu_init_anchor_imu_watermark_ns),
+               imu_init_buffer->anchorHasPrecedingImu() ? "true" : "false",
+               static_cast<unsigned long long>(
+                   imu_init_buffer->anchorPredecessorStampNs()),
+               static_cast<unsigned long long>(
+                   imu_init_buffer->anchorStampNs() >=
+                           imu_init_buffer->anchorPredecessorStampNs()
+                       ? imu_init_buffer->anchorStampNs() -
+                             imu_init_buffer->anchorPredecessorStampNs()
+                       : 0));
+    }
+    return;
+  }
+
+  if (imu_init_buffer->anchorLatched()) return;
+  if (!imu_init_buffer->latchLiveAnchor(synchronized_epoch_ns))
+  {
+    failImuInitialization(imu_init_buffer->failureReason(),
+                          synchronized_epoch_ns);
+    return;
+  }
+  imu_init_anchor_lidar_watermark_ns =
+      sensorSecondsToNanoseconds(lidar_watermark);
+  imu_init_anchor_image_epoch_ns = sensorSecondsToNanoseconds(image_epoch);
+  imu_init_anchor_imu_watermark_ns =
+      sensorSecondsToNanoseconds(last_timestamp_imu);
+  ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+           "\"status\":\"anchor_latched\",\"anchor_mode\":\"live_first_full_sync\","
+           "\"anchor_stamp_ns\":\"%llu\",\"lidar_watermark_ns\":\"%llu\","
+           "\"image_epoch_ns\":\"%llu\",\"imu_watermark_ns\":\"%llu\","
+           "\"has_pre_anchor_imu\":%s,"
+           "\"anchor_predecessor_stamp_ns\":\"%llu\","
+           "\"anchor_predecessor_gap_ns\":\"%llu\"}",
+           static_cast<unsigned long long>(imu_init_buffer->anchorStampNs()),
+           static_cast<unsigned long long>(imu_init_anchor_lidar_watermark_ns),
+           static_cast<unsigned long long>(imu_init_anchor_image_epoch_ns),
+           static_cast<unsigned long long>(imu_init_anchor_imu_watermark_ns),
+           imu_init_buffer->anchorHasPrecedingImu() ? "true" : "false",
+           static_cast<unsigned long long>(
+               imu_init_buffer->anchorPredecessorStampNs()),
+           static_cast<unsigned long long>(
+               imu_init_buffer->anchorStampNs() >=
+                       imu_init_buffer->anchorPredecessorStampNs()
+                   ? imu_init_buffer->anchorStampNs() -
+                         imu_init_buffer->anchorPredecessorStampNs()
+                   : 0));
+}
+
+void LIVMapper::failImuInitialization(
+    const std::string &reason, const std::uint64_t synchronized_epoch_ns)
+{
+  if (imu_init_failed) return;
+  imu_init_failed = true;
+  imu_init_failure_reason = reason;
+  const std::uint64_t anchor_stamp_ns =
+      imu_init_buffer ? imu_init_buffer->anchorStampNs() : 0;
+  ROS_FATAL("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+            "\"status\":\"failed\",\"anchor_mode\":\"%s\","
+            "\"anchor_stamp_ns\":\"%llu\",\"sync_epoch_ns\":\"%llu\","
+            "\"reason\":\"%s\"}",
+            imu_init_anchor_explicit ? "explicit" : "live_first_full_sync",
+            static_cast<unsigned long long>(anchor_stamp_ns),
+            static_cast<unsigned long long>(synchronized_epoch_ns),
+            reason.c_str());
+  ros::shutdown();
+}
+
+void LIVMapper::logAcceptedImuInitialization(
+    const std::uint64_t state_epoch_ns)
+{
+  if (imu_init_accepted_logged || !imu_init_buffer) return;
+  const V3D &mean_acc = p_imu->imu_init_mean_acc();
+  const V3D &mean_gyr = p_imu->imu_init_mean_gyr();
+  const auto &selected_samples = p_imu->imu_init_selected_samples();
+  if (selected_samples.empty())
+  {
+    failImuInitialization(
+        "initializer accepted without a selected stamp/sequence vector",
+        state_epoch_ns);
+    return;
+  }
+  imu_init_accepted_logged = true;
+  const std::uint64_t first_stamp_ns = selected_samples.front().first;
+  const std::uint64_t last_stamp_ns = selected_samples.back().first;
+  const std::string selected_vector_sha256 =
+      selectedImuVectorSha256(selected_samples);
+  imu_init_initial_state_sha256 = initialStateSha256(_state);
+  std::ostringstream selected_vector;
+  selected_vector << '[';
+  for (std::size_t index = 0; index < selected_samples.size(); ++index)
+  {
+    if (index != 0) selected_vector << ',';
+    selected_vector << "{\"stamp_ns\":\""
+                    << selected_samples[index].first << "\",\"seq\":"
+                    << selected_samples[index].second << '}';
+  }
+  selected_vector << ']';
+  ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+           "\"status\":\"accepted\",\"anchor_mode\":\"%s\","
+           "\"anchor_stamp_ns\":\"%llu\",\"state_epoch_ns\":\"%llu\","
+           "\"first_used_stamp_ns\":\"%llu\",\"first_used_seq\":%u,"
+           "\"last_used_stamp_ns\":\"%llu\",\"last_used_seq\":%u,"
+           "\"valid_count\":%d,\"invalid_count\":%d,"
+           "\"rejected_window_count\":%d,\"queue_high_water\":%zu,"
+           "\"queue_drop_count\":%llu,\"emitted_count\":%llu,"
+           "\"selected_stamp_seq_sha256\":\"%s\","
+           "\"selected_stamp_seq\":%s,"
+           "\"initial_state_fingerprint_schema\":"
+           "\"fast_livo/initial_state_ieee754_be/v1\","
+           "\"initial_state_binary64_be_sha256\":\"%s\","
+           "\"gravity\":[%.17g,%.17g,%.17g],"
+           "\"bias_g\":[%.17g,%.17g,%.17g],"
+           "\"bias_a\":[%.17g,%.17g,%.17g],"
+           "\"inv_expo_time\":%.17g,"
+           "\"mean_acc\":[%.17g,%.17g,%.17g],"
+           "\"mean_gyr\":[%.17g,%.17g,%.17g],"
+           "\"initialization_gate_ready\":true}",
+           imu_init_anchor_explicit ? "explicit" : "live_first_full_sync",
+           static_cast<unsigned long long>(imu_init_buffer->anchorStampNs()),
+           static_cast<unsigned long long>(state_epoch_ns),
+           static_cast<unsigned long long>(first_stamp_ns),
+           p_imu->imu_init_first_seq(),
+           static_cast<unsigned long long>(last_stamp_ns),
+           p_imu->imu_init_last_seq(), p_imu->imu_init_sample_count(),
+           p_imu->imu_init_invalid_samples(),
+           p_imu->imu_init_rejected_windows(), imu_init_buffer->highWater(),
+           static_cast<unsigned long long>(imu_init_buffer->dropCount()),
+           static_cast<unsigned long long>(imu_init_buffer->emittedCount()),
+           selected_vector_sha256.c_str(), selected_vector.str().c_str(),
+           imu_init_initial_state_sha256.c_str(),
+           _state.gravity.x(), _state.gravity.y(), _state.gravity.z(),
+           _state.bias_g.x(), _state.bias_g.y(), _state.bias_g.z(),
+           _state.bias_a.x(), _state.bias_a.y(), _state.bias_a.z(),
+           _state.inv_expo_time,
+           mean_acc.x(), mean_acc.y(), mean_acc.z(), mean_gyr.x(),
+           mean_gyr.y(), mean_gyr.z());
+}
+
 void LIVMapper::processImu() 
 {
   // double t0 = omp_get_wtime();
 
-  p_imu->Process2(LidarMeasures, _state, feats_undistort);
+  const bool initialization_was_pending = p_imu->imu_need_init;
+  deque<sensor_msgs::Imu::ConstPtr> initialization_samples;
+  std::uint64_t state_epoch_ns = 0;
+  if (initialization_was_pending && imu_init_buffer &&
+      LidarMeasures.lio_vio_flg == LIO)
+  {
+    const MeasureGroup &measurement = LidarMeasures.measures.back();
+    state_epoch_ns = sensorSecondsToNanoseconds(measurement.lio_time);
+    imu_init_last_sync_epoch_ns = state_epoch_ns;
+    auto drained = imu_init_buffer->takeThrough(state_epoch_ns);
+    if (drained.failed)
+    {
+      failImuInitialization(drained.reason, state_epoch_ns);
+      return;
+    }
+    initialization_samples.swap(drained.samples);
+  }
+
+  p_imu->Process2(
+      LidarMeasures, _state, feats_undistort,
+      initialization_was_pending ? &initialization_samples : nullptr);
+
+  if (initialization_was_pending && !p_imu->imu_need_init)
+  {
+    logAcceptedImuInitialization(state_epoch_ns);
+    if (!imu_init_failed) imu_init_buffer->markComplete();
+  }
 
   if (gravity_align_en) gravityAlignment();
 
@@ -410,6 +871,10 @@ void LIVMapper::handleVIO()
   if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) 
   {
     std::cout << "[ VIO ] No point!!!" << std::endl;
+    // No visual posterior will follow this same-epoch LIO state, so it is the
+    // final correction for high-rate propagation after all.
+    if (imu_prop_enable && !p_imu->imu_need_init)
+      enqueue_imu_correction(_state, LidarMeasures.last_lio_update_time);
     return;
   }
     
@@ -427,7 +892,10 @@ void LIVMapper::handleVIO()
   vio_manager->state_update_enabled =
       vio_max_lio_features_for_fusion < 0 ||
       voxelmap_manager->effct_feat_num_ <= vio_max_lio_features_for_fusion;
-  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  const double image_time_s = LidarMeasures.measures.back().vio_time;
+  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list,
+                            voxelmap_manager->voxel_map_, image_time_s,
+                            image_time_s - _first_lidar_time);
 
   if (fusion_debug) {  // debug-only: log post-VIO internal quaternion (mapped to world offline) vs GT
     if (!dbg_fp) { dbg_fp = fopen("/tmp/fusion_debug.csv", "w"); fprintf(dbg_fp, "t,stage,pqx,pqy,pqz,pqw,qx,qy,qz,qw,nfeat,px,py,pz,rqx,rqy,rqz,rqw,vio_inlier_ratio,vio_error_ratio,lio_trans_info_ratio,lio_rot_info_ratio,lio_info_min_per_feature,vio_trans_info_ratio,vio_rot_info_ratio,vio_info_min_per_measurement\n"); }
@@ -445,12 +913,9 @@ void LIVMapper::handleVIO()
     fflush(dbg_fp);
   }
 
-  if (imu_prop_enable) 
+  if (imu_prop_enable && !p_imu->imu_need_init)
   {
-    ekf_finish_once = true;
-    latest_ekf_state = _state;
-    latest_ekf_time = LidarMeasures.last_lio_update_time;
-    state_update_flg = true;
+    enqueue_imu_correction(_state, LidarMeasures.last_lio_update_time);
   }
 
   // monitor: fill /cloud_visual_sub_map_before from the ACTIVE visual_submap (upstream fill was disabled)
@@ -483,7 +948,8 @@ void LIVMapper::handleLIO()
            
   if (imu_only_mode)  // real IMU-only: _state here is already the IMU-propagated state (Process2); publish it, skip LIO update + map
   {
-    if (imu_prop_enable) { ekf_finish_once = true; latest_ekf_state = _state; latest_ekf_time = LidarMeasures.last_lio_update_time; state_update_flg = true; }
+    if (imu_prop_enable && !p_imu->imu_need_init)
+      enqueue_imu_correction(_state, LidarMeasures.last_lio_update_time);
     euler_cur = RotMtoEuler(_state.rot_end);
     geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
     publish_odometry(pubOdomAftMapped);
@@ -540,12 +1006,12 @@ void LIVMapper::handleLIO()
 
   double t2 = omp_get_wtime();
 
-  if (imu_prop_enable) 
+  // In LIVO mode the immediately following VIO update has the same sensor
+  // epoch and is the final posterior. Queue that one only; otherwise a timer
+  // between LIO and VIO can publish two different corrections with one stamp.
+  if (imu_prop_enable && !p_imu->imu_need_init && slam_mode_ != LIVO)
   {
-    ekf_finish_once = true;
-    latest_ekf_state = _state;
-    latest_ekf_time = LidarMeasures.last_lio_update_time;
-    state_update_flg = true;
+    enqueue_imu_correction(_state, LidarMeasures.last_lio_update_time);
   }
 
   if (pose_output_en) 
@@ -722,6 +1188,20 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
+  if (imu_init_failed)
+    throw std::runtime_error("IMU initialization failed: " +
+                             imu_init_failure_reason);
+  if (imu_init_anchor_explicit && p_imu->imu_need_init)
+  {
+    ROS_FATAL("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+              "\"status\":\"failed\",\"anchor_mode\":\"explicit\","
+              "\"anchor_stamp_ns\":\"%llu\","
+              "\"reason\":\"explicit anchor missing or initialization incomplete before shutdown\"}",
+              static_cast<unsigned long long>(
+                  imu_init_buffer ? imu_init_buffer->anchorStampNs() : 0));
+    throw std::runtime_error(
+        "explicit IMU initialization anchor missing or incomplete");
+  }
   savePCD();
 }
 
@@ -745,129 +1225,443 @@ void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D 
   imu_prop_state.vel_end = imu_prop_state.vel_end + acc_imu * dt;
 }
 
+void LIVMapper::enqueue_imu_correction(const StatesGroup &state,
+                                       const double stamp)
+{
+  if (!std::isfinite(stamp) || stamp <= 0.0)
+  {
+    ROS_ERROR_THROTTLE(1.0,
+        "[imu_prop] refusing correction with invalid sensor stamp %.9f", stamp);
+    return;
+  }
+
+  // A correction state can only be interpreted at an epoch that the sensor
+  // stream has actually reached.  This also rejects the stale first-LiDAR
+  // timestamp that older initialization control flow could carry forward.
+  if (!std::isfinite(last_timestamp_imu) ||
+      stamp > last_timestamp_imu + 1e-6)
+  {
+    ++imu_prop_correction_drop_count;
+    ROS_ERROR_THROTTLE(1.0,
+        "[imu_prop] refusing correction %.9f beyond latest IMU %.9f (dropped=%llu)",
+        stamp, last_timestamp_imu,
+        static_cast<unsigned long long>(imu_prop_correction_drop_count));
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mtx_buffer_imu_prop);
+  if (std::isfinite(last_prop_correction_stamp) &&
+      stamp <= last_prop_correction_stamp + 1e-9)
+  {
+    ++imu_prop_correction_drop_count;
+    ROS_ERROR_THROTTLE(1.0,
+        "[imu_prop] stale/duplicate correction %.9f <= applied %.9f (dropped=%llu)",
+        stamp, last_prop_correction_stamp,
+        static_cast<unsigned long long>(imu_prop_correction_drop_count));
+    return;
+  }
+
+  if (!prop_correction_buffer.empty())
+  {
+    const double queued_stamp = prop_correction_buffer.back().stamp;
+    if (stamp < queued_stamp - 1e-9)
+    {
+      ++imu_prop_correction_drop_count;
+      ROS_ERROR_THROTTLE(1.0,
+          "[imu_prop] out-of-order correction %.9f < queued %.9f (dropped=%llu)",
+          stamp, queued_stamp,
+          static_cast<unsigned long long>(imu_prop_correction_drop_count));
+      return;
+    }
+    if (std::abs(stamp - queued_stamp) <= 1e-9)
+    {
+      // LIVO performs LIO then VIO at the same image epoch.  Retain the final
+      // (post-VIO) state rather than publishing/replaying two different states
+      // with the same timestamp.
+      prop_correction_buffer.back().state = state;
+      ekf_finish_once = true;
+      return;
+    }
+  }
+
+  if (static_cast<int>(prop_correction_buffer.size()) >=
+      imu_prop_correction_queue_max)
+  {
+    prop_correction_buffer.pop_front();
+    ++imu_prop_correction_drop_count;
+    ROS_ERROR_THROTTLE(1.0,
+        "[imu_prop] correction queue overflow; oldest snapshot dropped (total=%llu)",
+        static_cast<unsigned long long>(imu_prop_correction_drop_count));
+  }
+  prop_correction_buffer.push_back({stamp, state});
+  imu_prop_correction_high_water =
+      std::max(imu_prop_correction_high_water, prop_correction_buffer.size());
+  ekf_finish_once = true;
+}
+
+void LIVMapper::publish_correction_pose_cov(const StatesGroup &state,
+                                            const double stamp)
+{
+  if (!body_calib_en || !vio_manager) return;
+
+  Eigen::Isometry3d T_WI = Eigen::Isometry3d::Identity();
+  T_WI.linear() = state.rot_end;
+  T_WI.translation() = state.pos_end;
+  Eigen::Isometry3d T_CI = Eigen::Isometry3d::Identity();
+  T_CI.linear() = vio_manager->Rci;
+  T_CI.translation() = vio_manager->Pci;
+  Eigen::Isometry3d T_BC = Eigen::Isometry3d::Identity();
+  T_BC.linear() = R_cam2body;
+  T_BC.translation() = t_cam2body;
+  const Eigen::Isometry3d T_IB = T_CI.inverse() * T_BC.inverse();
+  Eigen::Isometry3d T_bridge = Eigen::Isometry3d::Identity();
+  T_bridge.linear() =
+      Eigen::Quaterniond(-0.5, 0.5, -0.5, 0.5).toRotationMatrix();
+  const Eigen::Isometry3d T_pub = T_bridge * T_WI * T_IB;
+
+  Eigen::Matrix3d r_ib_skew;
+  const Eigen::Vector3d r_ib = T_IB.translation();
+  r_ib_skew << 0.0, -r_ib.z(), r_ib.y(),
+               r_ib.z(), 0.0, -r_ib.x(),
+              -r_ib.y(), r_ib.x(), 0.0;
+  Eigen::Matrix<double, 6, DIM_STATE> J_pose =
+      Eigen::Matrix<double, 6, DIM_STATE>::Zero();
+  const Eigen::Matrix3d A = T_bridge.linear();
+  J_pose.block<3, 3>(0, 0) = -A * state.rot_end * r_ib_skew;
+  J_pose.block<3, 3>(0, 3) = A;
+  // FAST-LIVO uses a right-multiplicative attitude error in IMU axes;
+  // geometry_msgs pose covariance uses fixed/header-frame rotation axes.
+  J_pose.block<3, 3>(3, 0) = A * state.rot_end;
+  Eigen::Matrix<double, 6, 6> P_pose =
+      J_pose * state.cov * J_pose.transpose();
+  P_pose = 0.5 * (P_pose + P_pose.transpose());
+
+  if (!P_pose.allFinite())
+  {
+    ROS_ERROR_THROTTLE(1.0,
+        "[imu_prop] correction pose covariance contains NaN/Inf; not publishing");
+    return;
+  }
+
+  geometry_msgs::PoseWithCovarianceStamped pose_cov;
+  pose_cov.header.frame_id = "odom";
+  pose_cov.header.stamp.fromSec(stamp);
+  pose_cov.pose.pose.position.x = T_pub.translation().x();
+  pose_cov.pose.pose.position.y = T_pub.translation().y();
+  pose_cov.pose.pose.position.z = T_pub.translation().z();
+  const Eigen::Quaterniond q_pub(T_pub.linear());
+  pose_cov.pose.pose.orientation.x = q_pub.x();
+  pose_cov.pose.pose.orientation.y = q_pub.y();
+  pose_cov.pose.pose.orientation.z = q_pub.z();
+  pose_cov.pose.pose.orientation.w = q_pub.w();
+  for (int row = 0; row < 6; ++row)
+    for (int col = 0; col < 6; ++col)
+      pose_cov.pose.covariance[row * 6 + col] = P_pose(row, col);
+  pubCorrectionPoseCov.publish(pose_cov);
+}
+
+void LIVMapper::publish_imu_propagated(const sensor_msgs::Imu &imu)
+{
+  const V3D pos_i = imu_propagate.pos_end;
+  const V3D vel_i = imu_propagate.vel_end;
+  imu_prop_odom = nav_msgs::Odometry();
+  imu_prop_odom.header.stamp = imu.header.stamp;
+  imu_prop_odom.child_frame_id = "base_link";
+
+  if (body_calib_en && vio_manager)
+  {
+    // Publish the calibrated vehicle body in the permanent VIO-local frame.
+    Eigen::Isometry3d T_WI = Eigen::Isometry3d::Identity();
+    T_WI.linear() = imu_propagate.rot_end;
+    T_WI.translation() = imu_propagate.pos_end;
+    Eigen::Isometry3d T_CI = Eigen::Isometry3d::Identity();
+    T_CI.linear() = vio_manager->Rci;
+    T_CI.translation() = vio_manager->Pci;
+    Eigen::Isometry3d T_BC = Eigen::Isometry3d::Identity();
+    T_BC.linear() = R_cam2body;
+    T_BC.translation() = t_cam2body;
+    const Eigen::Isometry3d T_WB =
+        T_WI * T_CI.inverse() * T_BC.inverse();
+    Eigen::Isometry3d T_bridge = Eigen::Isometry3d::Identity();
+    T_bridge.linear() =
+        Eigen::Quaterniond(-0.5, 0.5, -0.5, 0.5).toRotationMatrix();
+    const Eigen::Isometry3d T_pub = T_bridge * T_WB;
+
+    const Eigen::Vector3d omega_i(
+        imu.angular_velocity.x - imu_propagate.bias_g.x(),
+        imu.angular_velocity.y - imu_propagate.bias_g.y(),
+        imu.angular_velocity.z - imu_propagate.bias_g.z());
+    const Eigen::Vector3d omega_wi = imu_propagate.rot_end * omega_i;
+    const Eigen::Vector3d r_w_ib =
+        T_WB.translation() - T_WI.translation();
+    const Eigen::Vector3d v_wb = vel_i + omega_wi.cross(r_w_ib);
+    const Eigen::Vector3d v_world = T_bridge.linear() * v_wb;
+    const Eigen::Vector3d omega_world = T_bridge.linear() * omega_wi;
+    const Eigen::Vector3d v_body =
+        T_pub.linear().transpose() * v_world;
+    const Eigen::Vector3d omega_body =
+        T_pub.linear().transpose() * omega_world;
+    const Eigen::Quaterniond q_pub(T_pub.linear());
+
+    imu_prop_odom.header.frame_id = "odom";
+    imu_prop_odom.pose.pose.position.x = T_pub.translation().x();
+    imu_prop_odom.pose.pose.position.y = T_pub.translation().y();
+    imu_prop_odom.pose.pose.position.z = T_pub.translation().z();
+    imu_prop_odom.pose.pose.orientation.x = q_pub.x();
+    imu_prop_odom.pose.pose.orientation.y = q_pub.y();
+    imu_prop_odom.pose.pose.orientation.z = q_pub.z();
+    imu_prop_odom.pose.pose.orientation.w = q_pub.w();
+    // nav_msgs/Odometry convention: twist is expressed in child_frame_id.
+    imu_prop_odom.twist.twist.linear.x = v_body.x();
+    imu_prop_odom.twist.twist.linear.y = v_body.y();
+    imu_prop_odom.twist.twist.linear.z = v_body.z();
+    imu_prop_odom.twist.twist.angular.x = omega_body.x();
+    imu_prop_odom.twist.twist.angular.y = omega_body.y();
+    imu_prop_odom.twist.twist.angular.z = omega_body.z();
+
+    geometry_msgs::TwistStamped world_twist;
+    world_twist.header = imu_prop_odom.header;
+    world_twist.twist.linear.x = v_world.x();
+    world_twist.twist.linear.y = v_world.y();
+    world_twist.twist.linear.z = v_world.z();
+    world_twist.twist.angular.x = omega_world.x();
+    world_twist.twist.angular.y = omega_world.y();
+    world_twist.twist.angular.z = omega_world.z();
+    pubImuPropWorldTwist.publish(world_twist);
+  }
+  else
+  {
+    // Uncalibrated fallback describes the IMU rather than the vehicle body.
+    const Eigen::Matrix3d R_bridge =
+        Eigen::Quaterniond(-0.5, 0.5, -0.5, 0.5).toRotationMatrix();
+    const Eigen::Matrix3d R_pub = R_bridge * imu_propagate.rot_end;
+    const Eigen::Vector3d p_pub = R_bridge * pos_i;
+    const Eigen::Vector3d v_world = R_bridge * vel_i;
+    const Eigen::Vector3d v_child = R_pub.transpose() * v_world;
+    const Eigen::Vector3d omega_child(
+        imu.angular_velocity.x - imu_propagate.bias_g.x(),
+        imu.angular_velocity.y - imu_propagate.bias_g.y(),
+        imu.angular_velocity.z - imu_propagate.bias_g.z());
+    const Eigen::Quaterniond q_pub(R_pub);
+    imu_prop_odom.header.frame_id = "odom";
+    imu_prop_odom.child_frame_id = "imu_link";
+    imu_prop_odom.pose.pose.position.x = p_pub.x();
+    imu_prop_odom.pose.pose.position.y = p_pub.y();
+    imu_prop_odom.pose.pose.position.z = p_pub.z();
+    imu_prop_odom.pose.pose.orientation.w = q_pub.w();
+    imu_prop_odom.pose.pose.orientation.x = q_pub.x();
+    imu_prop_odom.pose.pose.orientation.y = q_pub.y();
+    imu_prop_odom.pose.pose.orientation.z = q_pub.z();
+    imu_prop_odom.twist.twist.linear.x = v_child.x();
+    imu_prop_odom.twist.twist.linear.y = v_child.y();
+    imu_prop_odom.twist.twist.linear.z = v_child.z();
+    imu_prop_odom.twist.twist.angular.x = omega_child.x();
+    imu_prop_odom.twist.twist.angular.y = omega_child.y();
+    imu_prop_odom.twist.twist.angular.z = omega_child.z();
+
+    geometry_msgs::TwistStamped world_twist;
+    world_twist.header = imu_prop_odom.header;
+    const Eigen::Vector3d omega_world = R_pub * omega_child;
+    world_twist.twist.linear.x = v_world.x();
+    world_twist.twist.linear.y = v_world.y();
+    world_twist.twist.linear.z = v_world.z();
+    world_twist.twist.angular.x = omega_world.x();
+    world_twist.twist.angular.y = omega_world.y();
+    world_twist.twist.angular.z = omega_world.z();
+    pubImuPropWorldTwist.publish(world_twist);
+  }
+
+  // High-rate covariance remains explicitly unknown (all zero): only the mean
+  // follows this lightweight propagation.  Corrected covariance is published
+  // separately at estimator correction epochs.
+  pubImuPropOdom.publish(imu_prop_odom);
+}
+
 void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
 {
-  if (p_imu->imu_need_init || !new_imu || !ekf_finish_once) { return; }
-  mtx_buffer_imu_prop.lock();
-  new_imu = false; // 控制propagate频率和IMU频率一致
-  if (imu_prop_enable && !prop_imu_buffer.empty())
+  if (!imu_prop_enable || p_imu->imu_need_init) return;
+
+  std::lock_guard<std::mutex> lock(mtx_buffer_imu_prop);
+  if (!ekf_finish_once ||
+      (prop_correction_buffer.empty() && prop_imu_buffer.empty()))
+    return;
+
+  // Publish every queued correction covariance.  For mean propagation only
+  // the newest correction matters if several arrived before this timer ran.
+  bool have_correction = false;
+  ImuCorrectionSnapshot newest_correction;
+  while (!prop_correction_buffer.empty())
   {
-    static double last_t_from_lidar_end_time = 0;
-    if (state_update_flg)
+    const ImuCorrectionSnapshot correction = prop_correction_buffer.front();
+    prop_correction_buffer.pop_front();
+    if (!std::isfinite(correction.stamp) || correction.stamp <= 0.0 ||
+        (std::isfinite(last_prop_correction_stamp) &&
+         correction.stamp < last_prop_correction_stamp - 1e-9))
     {
-      imu_propagate = latest_ekf_state;
-      // drop all useless imu pkg
-      while ((!prop_imu_buffer.empty() && prop_imu_buffer.front().header.stamp.toSec() < latest_ekf_time))
-      {
-        prop_imu_buffer.pop_front();
-      }
-      last_t_from_lidar_end_time = 0;
-      for (int i = 0; i < prop_imu_buffer.size(); i++)
-      {
-        double t_from_lidar_end_time = prop_imu_buffer[i].header.stamp.toSec() - latest_ekf_time;
-        double dt = t_from_lidar_end_time - last_t_from_lidar_end_time;
-        // cout << "prop dt" << dt << ", " << t_from_lidar_end_time << ", " << last_t_from_lidar_end_time << endl;
-        V3D acc_imu(prop_imu_buffer[i].linear_acceleration.x, prop_imu_buffer[i].linear_acceleration.y, prop_imu_buffer[i].linear_acceleration.z);
-        V3D omg_imu(prop_imu_buffer[i].angular_velocity.x, prop_imu_buffer[i].angular_velocity.y, prop_imu_buffer[i].angular_velocity.z);
-        prop_imu_once(imu_propagate, dt, acc_imu, omg_imu);
-        last_t_from_lidar_end_time = t_from_lidar_end_time;
-      }
-      state_update_flg = false;
+      ++imu_prop_correction_drop_count;
+      continue;
     }
-    else
+    // Corrections older than an already applied epoch can remain queued only
+    // during startup/reinitialization.  They are not valid posteriors for
+    // either mean reset or covariance publication.
+    if (std::isfinite(last_prop_correction_stamp) &&
+        correction.stamp <= last_prop_correction_stamp + 1e-9)
     {
-      V3D acc_imu(newest_imu.linear_acceleration.x, newest_imu.linear_acceleration.y, newest_imu.linear_acceleration.z);
-      V3D omg_imu(newest_imu.angular_velocity.x, newest_imu.angular_velocity.y, newest_imu.angular_velocity.z);
-      double t_from_lidar_end_time = newest_imu.header.stamp.toSec() - latest_ekf_time;
-      double dt = t_from_lidar_end_time - last_t_from_lidar_end_time;
-      prop_imu_once(imu_propagate, dt, acc_imu, omg_imu);
-      last_t_from_lidar_end_time = t_from_lidar_end_time;
+      ++imu_prop_correction_drop_count;
+      continue;
     }
-
-    V3D posi, vel_i;
-    Eigen::Quaterniond q;
-    posi = imu_propagate.pos_end;
-    vel_i = imu_propagate.vel_end;
-    q = Eigen::Quaterniond(imu_propagate.rot_end);
-    imu_prop_odom.header.stamp = newest_imu.header.stamp;
-    imu_prop_odom.child_frame_id = "base_link";
-    if (body_calib_en && vio_manager) {
-      // Publish the BODY(marker) pose, not the raw IMU, so /aft_mapped_to_body_imu_propagated matches
-      // /aft_mapped_to_body. The planner reads YAW from this odom (state_manager.py); the
-      // raw IMU optical frame gives a ~90deg-wrong heading and disagrees with the EKF2/
-      // control body frame. Same hand-eye chain as publish_body_optitrack, plus twist, at
-      // IMU rate. World bridge: optitrack anchor when latched (global == /aft_mapped_to_optitrack),
-      // else the q_o2r optical->ROS flip (VIO-local == /aft_mapped_to_body).
-      Eigen::Isometry3d T_WI = Eigen::Isometry3d::Identity();
-      T_WI.linear() = imu_propagate.rot_end;  T_WI.translation() = imu_propagate.pos_end;
-      Eigen::Isometry3d T_CI = Eigen::Isometry3d::Identity();
-      T_CI.linear() = vio_manager->Rci;  T_CI.translation() = vio_manager->Pci;
-      Eigen::Isometry3d T_BC = Eigen::Isometry3d::Identity();
-      T_BC.linear() = R_cam2body;  T_BC.translation() = t_cam2body;
-      Eigen::Isometry3d T_WB = T_WI * T_CI.inverse() * T_BC.inverse();
-
-      Eigen::Isometry3d T_bridge = Eigen::Isometry3d::Identity();
-      if (body_anchor_latched) T_bridge = T_anchor;                                       // global (optitrack)
-      else T_bridge.linear() = Eigen::Quaterniond(-0.5, 0.5, -0.5, 0.5).toRotationMatrix();// q_o2r (w,x,y,z)
-      Eigen::Isometry3d T_pub = T_bridge * T_WB;
-      Eigen::Vector3d   v_pub = T_bridge.linear() * vel_i;   // world-frame vel; marker lever-arm ignored (small)
-      Eigen::Quaterniond q_pub(T_pub.linear());
-
-      imu_prop_odom.header.frame_id = "odom";
-      imu_prop_odom.pose.pose.position.x = T_pub.translation().x();
-      imu_prop_odom.pose.pose.position.y = T_pub.translation().y();
-      imu_prop_odom.pose.pose.position.z = T_pub.translation().z();
-      imu_prop_odom.pose.pose.orientation.x = q_pub.x();
-      imu_prop_odom.pose.pose.orientation.y = q_pub.y();
-      imu_prop_odom.pose.pose.orientation.z = q_pub.z();
-      imu_prop_odom.pose.pose.orientation.w = q_pub.w();
-      imu_prop_odom.twist.twist.linear.x = v_pub.x();
-      imu_prop_odom.twist.twist.linear.y = v_pub.y();
-      imu_prop_odom.twist.twist.linear.z = v_pub.z();
-    } else if (gt_odom_received) {
-      // Legacy IMU gt-latch (body_calib off): odom_pose = odom_to_camera_init * camera_init_pose,
-      // so /aft_mapped_to_body_imu_propagated starts at the true mocap pose (matches the sim `ml` branch).
-      tf::Transform odom_to_cam_init_tf;
-      odom_to_cam_init_tf.setOrigin(tf::Vector3(odom_to_camera_init.translation.x,
-                                                odom_to_camera_init.translation.y,
-                                                odom_to_camera_init.translation.z));
-      tf::Quaternion q_otc(odom_to_camera_init.rotation.x, odom_to_camera_init.rotation.y,
-                           odom_to_camera_init.rotation.z, odom_to_camera_init.rotation.w);
-      odom_to_cam_init_tf.setRotation(q_otc);
-      tf::Transform cam_init_pose_tf;
-      cam_init_pose_tf.setOrigin(tf::Vector3(posi.x(), posi.y(), posi.z()));
-      cam_init_pose_tf.setRotation(tf::Quaternion(q.x(), q.y(), q.z(), q.w()));
-      tf::Transform odom_pose_tf = odom_to_cam_init_tf * cam_init_pose_tf;
-      tf::Vector3 p = odom_pose_tf.getOrigin();
-      tf::Quaternion qt = odom_pose_tf.getRotation();
-      imu_prop_odom.header.frame_id = "odom";
-      imu_prop_odom.pose.pose.position.x = p.x();
-      imu_prop_odom.pose.pose.position.y = p.y();
-      imu_prop_odom.pose.pose.position.z = p.z();
-      imu_prop_odom.pose.pose.orientation.x = qt.x();
-      imu_prop_odom.pose.pose.orientation.y = qt.y();
-      imu_prop_odom.pose.pose.orientation.z = qt.z();
-      imu_prop_odom.pose.pose.orientation.w = qt.w();
-      tf::Vector3 vel_odom = tf::quatRotate(q_otc, tf::Vector3(vel_i.x(), vel_i.y(), vel_i.z()));
-      imu_prop_odom.twist.twist.linear.x = vel_odom.x();
-      imu_prop_odom.twist.twist.linear.y = vel_odom.y();
-      imu_prop_odom.twist.twist.linear.z = vel_odom.z();
-    } else {
-      imu_prop_odom.header.frame_id = "world";
-      imu_prop_odom.pose.pose.position.x = posi.x();
-      imu_prop_odom.pose.pose.position.y = posi.y();
-      imu_prop_odom.pose.pose.position.z = posi.z();
-      imu_prop_odom.pose.pose.orientation.w = q.w();
-      imu_prop_odom.pose.pose.orientation.x = q.x();
-      imu_prop_odom.pose.pose.orientation.y = q.y();
-      imu_prop_odom.pose.pose.orientation.z = q.z();
-      imu_prop_odom.twist.twist.linear.x = vel_i.x();
-      imu_prop_odom.twist.twist.linear.y = vel_i.y();
-      imu_prop_odom.twist.twist.linear.z = vel_i.z();
+    if (!imu_init_first_correction_logged && imu_init_accepted_logged &&
+        !imu_init_initial_state_sha256.empty())
+    {
+      const std::uint64_t correction_stamp_ns =
+          sensorSecondsToNanoseconds(correction.stamp);
+      const std::string correction_state_sha256 =
+          initialStateSha256(correction.state);
+      ROS_INFO("[imu_init_diag] {\"schema\":\"fast_livo/imu_init/v1\","
+               "\"status\":\"first_correction_received\","
+               "\"correction_epoch_ns\":\"%llu\","
+               "\"state_fingerprint_schema\":"
+               "\"fast_livo/initial_state_ieee754_be/v1\","
+               "\"initial_state_binary64_be_sha256\":\"%s\","
+               "\"state_binary64_be_sha256\":\"%s\","
+               "\"qualification_gate_ready\":true}",
+               static_cast<unsigned long long>(correction_stamp_ns),
+               imu_init_initial_state_sha256.c_str(),
+               correction_state_sha256.c_str());
+      imu_init_first_correction_logged = true;
     }
-    pubImuPropOdom.publish(imu_prop_odom);
+    // Preserve covariance at every estimator correction epoch. Timer
+    // coalescing affects only which snapshot seeds the propagated mean.
+    publish_correction_pose_cov(correction.state, correction.stamp);
+    newest_correction = correction;
+    have_correction = true;
   }
-  mtx_buffer_imu_prop.unlock();
+
+  const auto finite_imu = [](const sensor_msgs::Imu &imu) {
+    const double stamp = imu.header.stamp.toSec();
+    return std::isfinite(stamp) && stamp > 0.0 &&
+           std::isfinite(imu.linear_acceleration.x) &&
+           std::isfinite(imu.linear_acceleration.y) &&
+           std::isfinite(imu.linear_acceleration.z) &&
+           std::isfinite(imu.angular_velocity.x) &&
+           std::isfinite(imu.angular_velocity.y) &&
+           std::isfinite(imu.angular_velocity.z);
+  };
+
+  const auto propagate_sample = [&](const sensor_msgs::Imu &imu,
+                                    const bool publish) {
+    if (!finite_imu(imu))
+    {
+      ++imu_prop_invalid_sample_count;
+      return false;
+    }
+    const double stamp = imu.header.stamp.toSec();
+    const double dt = stamp - last_propagated_imu_stamp;
+    if (!std::isfinite(dt) || dt <= 0.0)
+    {
+      ++imu_prop_nonmonotonic_count;
+      ROS_ERROR_THROTTLE(1.0,
+          "[imu_prop] non-positive propagation dt %.9f at %.9f (total=%llu)",
+          dt, stamp,
+          static_cast<unsigned long long>(imu_prop_nonmonotonic_count));
+      return false;
+    }
+    if (dt > imu_prop_max_dt)
+    {
+      ++imu_prop_gap_count;
+      imu_propagation_valid = false;
+      ROS_ERROR_THROTTLE(1.0,
+          "[imu_prop] IMU gap %.6fs exceeds %.6fs; suppressing propagated output until next correction (total=%llu)",
+          dt, imu_prop_max_dt,
+          static_cast<unsigned long long>(imu_prop_gap_count));
+      return false;
+    }
+    if (!imu_propagation_valid) return false;
+
+    const V3D acc(imu.linear_acceleration.x, imu.linear_acceleration.y,
+                  imu.linear_acceleration.z);
+    const V3D gyr(imu.angular_velocity.x, imu.angular_velocity.y,
+                  imu.angular_velocity.z);
+    prop_imu_once(imu_propagate, dt, acc, gyr);
+    last_propagated_imu_stamp = stamp;
+    if (publish) publish_imu_propagated(imu);
+    return true;
+  };
+
+  if (have_correction)
+  {
+    imu_propagate = newest_correction.state;
+    last_propagated_imu_stamp = newest_correction.stamp;
+    last_prop_correction_stamp = newest_correction.stamp;
+    imu_propagation_valid = true;
+
+    // A correction already incorporates every IMU sample through its sensor
+    // epoch.  Retain/replay only the later history needed to bring that state
+    // back to the most recent high-rate epoch.
+    while (!prop_imu_history.empty() &&
+           prop_imu_history.front().header.stamp.toSec() <=
+               newest_correction.stamp + 1e-9)
+      prop_imu_history.pop_front();
+    for (const sensor_msgs::Imu &imu : prop_imu_history)
+    {
+      if (!propagate_sample(imu, false) && !imu_propagation_valid) break;
+    }
+  }
+
+  // Drain every pending IMU exactly once and publish one state per successfully
+  // integrated sensor timestamp.  Processed samples move to bounded history so
+  // a later, slightly older correction can be replayed without data loss.
+  while (!prop_imu_buffer.empty())
+  {
+    const sensor_msgs::Imu imu = prop_imu_buffer.front();
+    prop_imu_buffer.pop_front();
+    const double stamp = imu.header.stamp.toSec();
+    if (!finite_imu(imu))
+    {
+      ++imu_prop_invalid_sample_count;
+      continue;
+    }
+    if (std::isfinite(last_prop_correction_stamp) &&
+        stamp <= last_prop_correction_stamp + 1e-9)
+    {
+      // Incorporated in the correction posterior; do not emit a stale
+      // pre-correction pose for this sensor sample.
+      ++imu_prop_superseded_count;
+      continue;
+    }
+
+    prop_imu_history.push_back(imu);
+    imu_prop_history_high_water =
+        std::max(imu_prop_history_high_water, prop_imu_history.size());
+    if (imu_propagation_valid) propagate_sample(imu, true);
+  }
+
+  while (static_cast<int>(prop_imu_history.size()) > imu_prop_queue_max)
+  {
+    prop_imu_history.pop_front();
+    ++imu_prop_history_drop_count;
+  }
+  if (imu_prop_history_drop_count > 0)
+  {
+    ROS_WARN_THROTTLE(1.0,
+        "[imu_prop] bounded replay history dropped old samples (total=%llu, retained=%zu)",
+        static_cast<unsigned long long>(imu_prop_history_drop_count),
+        prop_imu_history.size());
+  }
+  ROS_INFO_THROTTLE(5.0,
+      "[imu_prop] health pending=%zu history=%zu corrections=%zu "
+      "high_water=[%zu %zu %zu] invalid=%llu nonmonotonic=%llu gaps=%llu "
+      "queue_drops=%llu history_drops=%llu correction_drops=%llu superseded=%llu",
+      prop_imu_buffer.size(), prop_imu_history.size(),
+      prop_correction_buffer.size(), imu_prop_pending_high_water,
+      imu_prop_history_high_water, imu_prop_correction_high_water,
+      static_cast<unsigned long long>(imu_prop_invalid_sample_count),
+      static_cast<unsigned long long>(imu_prop_nonmonotonic_count),
+      static_cast<unsigned long long>(imu_prop_gap_count),
+      static_cast<unsigned long long>(imu_prop_queue_drop_count),
+      static_cast<unsigned long long>(imu_prop_history_drop_count),
+      static_cast<unsigned long long>(imu_prop_correction_drop_count),
+      static_cast<unsigned long long>(imu_prop_superseded_count));
 }
 
 void LIVMapper::transformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud, PointCloudXYZI::Ptr &trans_cloud)
@@ -940,6 +1734,12 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  if (!ptr || ptr->size() <= 1) {
+    ROS_WARN_THROTTLE(1.0, "Dropping empty/degenerate standard point cloud");
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    return;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -995,27 +1795,48 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
   if (!imu_en) return;
 
-  if (last_timestamp_lidar < 0.0) return;
   // ROS_INFO("get imu at time: %.6f", msg_in->header.stamp.toSec());
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
   msg->header.stamp = ros::Time().fromSec(msg->header.stamp.toSec() - imu_time_offset);
   double timestamp = msg->header.stamp.toSec();
+  const bool lidar_seen = last_timestamp_lidar >= 0.0;
 
-  if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
+  if (lidar_seen && fabs(last_timestamp_lidar - timestamp) > 0.5 &&
+      (!ros_driver_fix_en))
   {
     ROS_WARN("IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
   }
 
-  if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
+  // Before the first LiDAR callback there is no valid cross-sensor epoch from
+  // which to infer the legacy integer-second driver correction.  Preserve the
+  // sensor header and let sync_packages accept/discard it by sensor time.  In
+  // the normal (ros_driver_fix_en=false) D435i path this makes replay startup
+  // independent of TCP callback arrival order without changing timestamps.
+  if (ros_driver_fix_en && lidar_seen)
+    timestamp += std::round(last_timestamp_lidar - timestamp);
   msg->header.stamp = ros::Time().fromSec(timestamp);
 
   mtx_buffer.lock();
 
   if (last_timestamp_imu > 0.0 && timestamp < last_timestamp_imu)
   {
+    const bool initialization_pending =
+        p_imu->imu_need_init && imu_init_buffer && !imu_init_failed;
+    const double backward_offset = last_timestamp_imu - timestamp;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-    ROS_ERROR("imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
+    if (initialization_pending)
+    {
+      std::ostringstream reason;
+      reason << "backward IMU timestamp rejected before initialization buffer admission: "
+             << msg->header.stamp.toNSec() << " (offset_s="
+             << std::setprecision(17) << backward_offset << ')';
+      failImuInitialization(reason.str());
+    }
+    else
+    {
+      ROS_ERROR("imu loop back, offset: %lf \n", backward_offset);
+    }
     return;
   }
 
@@ -1030,16 +1851,83 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
   last_timestamp_imu = timestamp;
 
+  if (!lidar_seen) ++imu_pre_lidar_sample_count;
+  if (static_cast<int>(imu_buffer.size()) >= imu_input_queue_max)
+  {
+    imu_buffer.pop_front();
+    ++imu_input_queue_drop_count;
+    ROS_ERROR_THROTTLE(1.0,
+        "IMU input queue overflow before synchronization; oldest sample dropped "
+        "(total=%llu, retained=%zu)",
+        static_cast<unsigned long long>(imu_input_queue_drop_count),
+        imu_buffer.size());
+  }
   imu_buffer.push_back(msg);
+  imu_input_high_water = std::max(imu_input_high_water, imu_buffer.size());
+  bool imu_init_push_failed = false;
+  std::string imu_init_push_failure;
+  if (p_imu->imu_need_init && imu_init_buffer && !imu_init_failed)
+  {
+    imu_init_push_failed = !imu_init_buffer->push(
+        msg, msg->header.stamp.toNSec());
+    if (imu_init_push_failed)
+      imu_init_push_failure = imu_init_buffer->failureReason();
+  }
   // cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
   mtx_buffer.unlock();
+  if (imu_init_push_failed)
+  {
+    failImuInitialization(imu_init_push_failure);
+    sig_buffer.notify_all();
+    return;
+  }
   if (imu_prop_enable)
   {
-    mtx_buffer_imu_prop.lock();
-    if (imu_prop_enable && !p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
-    newest_imu = *msg;
-    new_imu = true;
-    mtx_buffer_imu_prop.unlock();
+    std::lock_guard<std::mutex> lock(mtx_buffer_imu_prop);
+    // Retain the startup IMUs too.  The propagation timer remains disabled
+    // until initialization/correction, then discards samples at or before the
+    // correction sensor epoch and replays only the strictly newer suffix.
+    // Gating admission on imu_need_init used to create a callback-batching-
+    // dependent hole between the initialization window and first correction.
+    const bool finite = std::isfinite(timestamp) && timestamp > 0.0 &&
+        std::isfinite(msg->linear_acceleration.x) &&
+        std::isfinite(msg->linear_acceleration.y) &&
+        std::isfinite(msg->linear_acceleration.z) &&
+        std::isfinite(msg->angular_velocity.x) &&
+        std::isfinite(msg->angular_velocity.y) &&
+        std::isfinite(msg->angular_velocity.z);
+    if (!finite)
+    {
+      ++imu_prop_invalid_sample_count;
+      ROS_ERROR_THROTTLE(1.0,
+          "[imu_prop] invalid IMU sample rejected (total=%llu)",
+          static_cast<unsigned long long>(imu_prop_invalid_sample_count));
+    }
+    else if (std::isfinite(last_prop_imu_input_stamp) &&
+             timestamp <= last_prop_imu_input_stamp)
+    {
+      ++imu_prop_nonmonotonic_count;
+      ROS_ERROR_THROTTLE(1.0,
+          "[imu_prop] duplicate/backward input stamp %.9f after %.9f rejected (total=%llu)",
+          timestamp, last_prop_imu_input_stamp,
+          static_cast<unsigned long long>(imu_prop_nonmonotonic_count));
+    }
+    else
+    {
+      last_prop_imu_input_stamp = timestamp;
+      if (static_cast<int>(prop_imu_buffer.size()) >= imu_prop_queue_max)
+      {
+        prop_imu_buffer.pop_front();
+        ++imu_prop_queue_drop_count;
+        imu_propagation_valid = false;
+        ROS_ERROR_THROTTLE(1.0,
+            "[imu_prop] pending IMU queue overflow; output suppressed until next correction (dropped=%llu)",
+            static_cast<unsigned long long>(imu_prop_queue_drop_count));
+      }
+      prop_imu_buffer.push_back(*msg);
+      imu_prop_pending_high_water =
+          std::max(imu_prop_pending_high_water, prop_imu_buffer.size());
+    }
   }
   sig_buffer.notify_all();
 }
@@ -1072,7 +1960,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   double msg_header_time = msg->header.stamp.toSec() + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
   if (verbose) ROS_INFO("Get image, its header time: %.6f", msg_header_time);
-  if (last_timestamp_lidar < 0) return;
+  const bool lidar_seen = last_timestamp_lidar >= 0.0;
 
   if (msg_header_time < last_timestamp_img)
   {
@@ -1093,8 +1981,21 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   }
 
   cv::Mat img_cur = getImageFromMsg(msg);
+  if (!lidar_seen) ++img_pre_lidar_frame_count;
+  if (static_cast<int>(img_buffer.size()) >= img_input_queue_max)
+  {
+    img_buffer.pop_front();
+    img_time_buffer.pop_front();
+    ++img_input_queue_drop_count;
+    ROS_ERROR_THROTTLE(1.0,
+        "Image input queue overflow before synchronization; oldest frame dropped "
+        "(total=%llu, retained=%zu)",
+        static_cast<unsigned long long>(img_input_queue_drop_count),
+        img_buffer.size());
+  }
   img_buffer.push_back(img_cur);
   img_time_buffer.push_back(img_time_correct);
+  img_input_high_water = std::max(img_input_high_water, img_buffer.size());
 
   // ROS_INFO("Correct Image time: %.6f", img_time_correct);
 
@@ -1136,6 +2037,11 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // ROS_ERROR("out sync");
       return false;
     }
+
+    maybeLatchLiveImuInitAnchor(
+        meas.lidar_frame_end_time, meas.lidar_frame_end_time,
+        meas.lidar_frame_end_time);
+    if (imu_init_failed) return false;
 
     struct MeasureGroup m; // standard method to keep imu message.
 
@@ -1202,6 +2108,13 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         // , %lf \n", img_capture_time, lid_newest_time, imu_newest_time);
         return false;
       }
+
+      // This is the first point at which the image epoch is covered by both
+      // LiDAR and IMU sensor-time watermarks.  Latch the live initialization
+      // anchor here, before the normal synchronizer destructively pops IMUs.
+      maybeLatchLiveImuInitAnchor(
+          img_capture_time, lid_newest_time, img_capture_time);
+      if (imu_init_failed) return false;
 
       struct MeasureGroup m;
 
@@ -1622,6 +2535,7 @@ void LIVMapper::publish_body_optitrack()
 // at the true mocap pose.
 void LIVMapper::gt_odom_cbk(const geometry_msgs::PoseStamped::ConstPtr &msg_in)
 {
+  if (!mocap_anchor_enable) return;
   // Legacy first-message latch (kept for the imu_prop odom path / non-body fallback).
   if (!gt_odom_received) {
     odom_to_camera_init.translation.x = msg_in->pose.position.x;
@@ -1657,11 +2571,37 @@ void LIVMapper::reinit_cbk(const std_msgs::Empty::ConstPtr &msg_in)
   body_anchor_latched = false;
   gt_buf.clear();
   p_imu->Reset();
+  // Runtime reset is disabled in supported flight configurations.  If it is
+  // explicitly enabled, start a fresh live-anchor buffer; explicit offline
+  // anchors were rejected at configuration time because they cannot be reused.
+  imu_init_buffer.reset(new ImuInitSampleBuffer(
+      static_cast<std::size_t>(imu_init_queue_max),
+      static_cast<std::uint64_t>(std::llround(
+          imu_init_anchor_max_predecessor_gap_s * 1e9))));
+  imu_init_failed = false;
+  imu_init_accepted_logged = false;
+  imu_init_first_correction_logged = false;
+  imu_init_initial_state_sha256.clear();
+  imu_init_failure_reason.clear();
+  imu_init_anchor_lidar_watermark_ns = 0;
+  imu_init_anchor_image_epoch_ns = 0;
+  imu_init_anchor_imu_watermark_ns = 0;
+  imu_init_last_sync_epoch_ns = 0;
   _state.resetpose();
   vio_manager->resetGrid();
   vio_manager->visual_submap->reset();
   lidar_map_inited = false;
-  ekf_finish_once = false;
+  {
+    std::lock_guard<std::mutex> lock(mtx_buffer_imu_prop);
+    prop_imu_buffer.clear();
+    prop_imu_history.clear();
+    prop_correction_buffer.clear();
+    last_propagated_imu_stamp = std::numeric_limits<double>::quiet_NaN();
+    last_prop_imu_input_stamp = std::numeric_limits<double>::quiet_NaN();
+    last_prop_correction_stamp = std::numeric_limits<double>::quiet_NaN();
+    imu_propagation_valid = false;
+    ekf_finish_once = false;
+  }
   is_first_frame = true;
 }
 

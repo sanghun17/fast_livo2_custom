@@ -12,6 +12,217 @@ which is included as part of this source code package.
 
 #include "vio.h"
 
+#include <filesystem>
+
+namespace
+{
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
+using Matrix7d = Eigen::Matrix<double, 7, 7>;
+
+constexpr double kMinCameraDepthM = 1e-6;
+
+bool hasFinitePositiveDepth(const V3D &point_camera)
+{
+  return point_camera.allFinite() && point_camera[2] > kMinCameraDepthM;
+}
+
+bool voxelLocationLess(const VOXEL_LOCATION &lhs, const VOXEL_LOCATION &rhs)
+{
+  if (lhs.x != rhs.x) return lhs.x < rhs.x;
+  if (lhs.y != rhs.y) return lhs.y < rhs.y;
+  return lhs.z < rhs.z;
+}
+
+bool pointPositionLess(const V3D &lhs, const V3D &rhs)
+{
+  if (lhs.x() != rhs.x()) return lhs.x() < rhs.x();
+  if (lhs.y() != rhs.y()) return lhs.y() < rhs.y();
+  return lhs.z() < rhs.z();
+}
+
+bool preferMapPoint(float candidate_distance, const VisualPoint *candidate,
+                    float selected_distance, const VisualPoint *selected)
+{
+  if (selected == nullptr || candidate_distance < selected_distance) return true;
+  return candidate_distance == selected_distance &&
+         pointPositionLess(candidate->pos_, selected->pos_);
+}
+
+bool preferPointCandidate(float candidate_score, const pointWithVar &candidate,
+                          int selected_type, float selected_score,
+                          const pointWithVar &selected)
+{
+  if (!std::isfinite(candidate_score)) return false;
+  if (candidate_score > selected_score) return true;
+  // Preserve the upstream threshold semantics: a zero-score candidate does
+  // not populate an empty grid whose reset score is also zero.
+  return selected_type == VIOManager::TYPE_POINTCLOUD &&
+         candidate_score == selected_score &&
+         pointPositionLess(candidate.point_w, selected.point_w);
+}
+
+bool patchSamplingInBounds(const V2D &pixel, int scale, int patch_size,
+                           int patch_size_half, const cv::Mat &image,
+                           int expected_width, int expected_height,
+                           bool needs_gradient_border)
+{
+  if (!pixel.allFinite() || scale <= 0 || patch_size <= 0 || image.empty() ||
+      image.cols != expected_width || image.rows != expected_height ||
+      image.type() != CV_8UC1 || !image.isContinuous())
+    return false;
+
+  const int u_anchor = static_cast<int>(std::floor(pixel[0] / scale)) * scale;
+  const int v_anchor = static_cast<int>(std::floor(pixel[1] / scale)) * scale;
+  const int lower_extra = needs_gradient_border ? scale : 0;
+  const int upper_extra = needs_gradient_border ? 2 * scale : scale;
+  const int min_u = u_anchor - patch_size_half * scale - lower_extra;
+  const int min_v = v_anchor - patch_size_half * scale - lower_extra;
+  const int max_u = u_anchor + (patch_size - 1 - patch_size_half) * scale +
+                    upper_extra;
+  const int max_v = v_anchor + (patch_size - 1 - patch_size_half) * scale +
+                    upper_extra;
+  return min_u >= 0 && min_v >= 0 && max_u < image.cols &&
+         max_v < image.rows;
+}
+
+int checkedGridIndex(const V2D &pixel, int grid_size, int grid_n_width,
+                     int grid_n_height)
+{
+  if (!pixel.allFinite() || grid_size <= 0 || grid_n_width <= 0 ||
+      grid_n_height <= 0)
+    return -1;
+  const int col = static_cast<int>(std::floor(pixel[0] / grid_size));
+  const int row = static_cast<int>(std::floor(pixel[1] / grid_size));
+  if (col < 0 || col >= grid_n_width || row < 0 || row >= grid_n_height)
+    return -1;
+  return row * grid_n_width + col;
+}
+
+struct VisualInfoMetrics
+{
+  double rot_trace = 0.0;
+  double rot_eig_min = 0.0;
+  double rot_eig_mid = 0.0;
+  double rot_eig_max = 0.0;
+  double rot_condition_ratio = 0.0;
+  double trans_trace = 0.0;
+  double trans_eig_min = 0.0;
+  double trans_eig_mid = 0.0;
+  double trans_eig_max = 0.0;
+  double trans_condition_ratio = 0.0;
+  double pose_trace = 0.0;
+  double pose_eig_min = 0.0;
+  double pose_eig_max = 0.0;
+  double pose_condition_ratio = 0.0;
+};
+
+template <int N>
+Eigen::Matrix<double, N, 1> nonnegativeEigenvalues(
+    const Eigen::Matrix<double, N, N> &matrix)
+{
+  const Eigen::Matrix<double, N, N> symmetric =
+      0.5 * (matrix + matrix.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, N, N>> solver(symmetric);
+  Eigen::Matrix<double, N, 1> values = solver.eigenvalues();
+  for (int i = 0; i < N; ++i) values[i] = std::max(0.0, values[i]);
+  return values;
+}
+
+VisualInfoMetrics computeVisualInfoMetrics(const Matrix6d &raw_info)
+{
+  VisualInfoMetrics result;
+  const Matrix6d info = 0.5 * (raw_info + raw_info.transpose());
+  const M3D rot_info = info.block<3, 3>(0, 0);
+  const M3D trans_info = info.block<3, 3>(3, 3);
+  const V3D rot_eigs = nonnegativeEigenvalues<3>(rot_info);
+  const V3D trans_eigs = nonnegativeEigenvalues<3>(trans_info);
+  const Eigen::Matrix<double, 6, 1> pose_eigs =
+      nonnegativeEigenvalues<6>(info);
+
+  result.rot_trace = rot_info.trace();
+  result.rot_eig_min = rot_eigs[0];
+  result.rot_eig_mid = rot_eigs[1];
+  result.rot_eig_max = rot_eigs[2];
+  result.rot_condition_ratio = rot_eigs[0] / std::max(1e-12, rot_eigs[2]);
+  result.trans_trace = trans_info.trace();
+  result.trans_eig_min = trans_eigs[0];
+  result.trans_eig_mid = trans_eigs[1];
+  result.trans_eig_max = trans_eigs[2];
+  result.trans_condition_ratio =
+      trans_eigs[0] / std::max(1e-12, trans_eigs[2]);
+  result.pose_trace = info.trace();
+  result.pose_eig_min = pose_eigs[0];
+  result.pose_eig_max = pose_eigs[5];
+  result.pose_condition_ratio = pose_eigs[0] / std::max(1e-12, pose_eigs[5]);
+
+  return result;
+}
+
+template <int N>
+Eigen::Matrix<double, N, N> regularizedSPD(
+    const Eigen::Matrix<double, N, N> &raw_matrix)
+{
+  const Eigen::Matrix<double, N, N> symmetric =
+      0.5 * (raw_matrix + raw_matrix.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, N, N>> solver(symmetric);
+  Eigen::Matrix<double, N, 1> eigenvalues = solver.eigenvalues();
+  const double scale = std::max(1.0, eigenvalues.cwiseAbs().maxCoeff());
+  const double floor = 1e-12 * scale;
+  for (int i = 0; i < N; ++i) eigenvalues[i] = std::max(floor, eigenvalues[i]);
+  return solver.eigenvectors() * eigenvalues.asDiagonal() *
+         solver.eigenvectors().transpose();
+}
+
+template <int N>
+double stableLogDetSPD(const Eigen::Matrix<double, N, N> &matrix)
+{
+  const Eigen::Matrix<double, N, N> spd = regularizedSPD<N>(matrix);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, N, N>> solver(spd);
+  return solver.eigenvalues().array().log().sum();
+}
+
+Matrix6d exposureMarginalizedPoseInfo(const Matrix7d &raw_normal,
+                                      bool exposure_estimate_enabled)
+{
+  const Matrix7d normal = 0.5 * (raw_normal + raw_normal.transpose());
+  Matrix6d marginalized = normal.block<6, 6>(0, 0);
+  if (exposure_estimate_enabled)
+  {
+    const double exposure_info = normal(6, 6);
+    const double regularizer = std::max(1e-12, std::abs(exposure_info) * 1e-12);
+    const Eigen::Matrix<double, 6, 1> cross = normal.block<6, 1>(0, 6);
+    marginalized -= (cross * cross.transpose()) /
+                    std::max(regularizer, exposure_info);
+  }
+  marginalized = 0.5 * (marginalized + marginalized.transpose());
+  // Schur subtraction can produce tiny negative eigenvalues through roundoff.
+  // Project only the diagnostic copy to PSD; estimator matrices are untouched.
+  Eigen::SelfAdjointEigenSolver<Matrix6d> solver(marginalized);
+  Eigen::Matrix<double, 6, 1> eigenvalues = solver.eigenvalues();
+  for (int i = 0; i < 6; ++i) eigenvalues[i] = std::max(0.0, eigenvalues[i]);
+  return solver.eigenvectors() * eigenvalues.asDiagonal() *
+         solver.eigenvectors().transpose();
+}
+
+double poseInformationGainNats(const Matrix7d &raw_prior_cov,
+                               const Matrix7d &raw_measurement_normal)
+{
+  // Exposure is a shared nuisance state.  Incorporate the complete 7x7 prior,
+  // including pose/exposure correlation, update it with the complete normal
+  // matrix, and compare the marginalized 6x6 pose covariance determinants.
+  const Matrix7d prior_cov = regularizedSPD<7>(raw_prior_cov);
+  const Matrix7d prior_precision = prior_cov.inverse();
+  const Matrix7d posterior_cov =
+      regularizedSPD<7>(prior_precision + raw_measurement_normal).inverse();
+  const Matrix6d prior_pose_cov = prior_cov.block<6, 6>(0, 0);
+  const Matrix6d posterior_pose_cov = posterior_cov.block<6, 6>(0, 0);
+  const double gain = 0.5 *
+      (stableLogDetSPD<6>(prior_pose_cov) -
+       stableLogDetSPD<6>(posterior_pose_cov));
+  return std::max(0.0, gain);
+}
+}  // namespace
+
 VIOManager::VIOManager()
 {
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
@@ -19,11 +230,387 @@ VIOManager::VIOManager()
 
 VIOManager::~VIOManager()
 {
+  if (visual_quality_frames_stream.is_open()) visual_quality_frames_stream.close();
+  if (visual_quality_points_stream.is_open()) visual_quality_points_stream.close();
   delete visual_submap;
   for (auto& pair : warp_map) delete pair.second;
   warp_map.clear();
   for (auto& pair : feat_map) delete pair.second;
   feat_map.clear();
+}
+
+bool VIOManager::ensureVisualQualityLogOpen()
+{
+  if (!visual_quality_log_enabled) return false;
+  if (visual_quality_frames_stream.is_open() &&
+      visual_quality_points_stream.is_open()) return true;
+
+  try
+  {
+    const std::filesystem::path prefix_path(visual_quality_output_prefix);
+    if (!prefix_path.parent_path().empty())
+      std::filesystem::create_directories(prefix_path.parent_path());
+  }
+  catch (const std::exception &error)
+  {
+    std::cerr << "[VIO quality] cannot create output directory for '"
+              << visual_quality_output_prefix << "': " << error.what() << std::endl;
+    visual_quality_log_enabled = false;
+    return false;
+  }
+
+  visual_quality_frames_stream.open(
+      visual_quality_output_prefix + "_frames.csv", std::ios::out | std::ios::trunc);
+  visual_quality_points_stream.open(
+      visual_quality_output_prefix + "_points.csv", std::ios::out | std::ios::trunc);
+  if (!visual_quality_frames_stream.good() || !visual_quality_points_stream.good())
+  {
+    std::cerr << "[VIO quality] cannot open CSV prefix '"
+              << visual_quality_output_prefix << "'" << std::endl;
+    if (visual_quality_frames_stream.is_open()) visual_quality_frames_stream.close();
+    if (visual_quality_points_stream.is_open()) visual_quality_points_stream.close();
+    visual_quality_log_enabled = false;
+    return false;
+  }
+
+  visual_quality_frames_stream
+      << "frame_index,img_time_s,img_rel_s,width,height,state_update_enabled,"
+      << "active_count,valid_final_count,improved_count,improved_ratio,"
+      << "prop_sse_sum,final_sse_sum,error_ratio,rot_trace,rot_eig_min,"
+      << "rot_eig_mid,rot_eig_max,rot_condition_ratio,trans_trace,"
+      << "trans_eig_min,trans_eig_mid,trans_eig_max,trans_condition_ratio,"
+      << "pose_trace,pose_eig_min,pose_eig_max,pose_condition_ratio,"
+      << "marg_rot_trace,marg_rot_eig_min,marg_rot_eig_mid,marg_rot_eig_max,"
+      << "marg_rot_condition_ratio,marg_trans_trace,marg_trans_eig_min,"
+      << "marg_trans_eig_mid,marg_trans_eig_max,marg_trans_condition_ratio,"
+      << "marg_pose_trace,marg_pose_eig_min,marg_pose_eig_max,"
+      << "marg_pose_condition_ratio,pose_information_gain_nats\n";
+  visual_quality_points_stream
+      << "frame_index,img_time_s,img_rel_s,point_index,stage,u,v,x_w,y_w,z_w,"
+      << "depth_m,range_m,view_cos,shi_tomasi,ncc,search_level,prop_sse,"
+      << "retrieve_prop_sse,prop_rmse,final_sse,final_rmse,improved,rot_trace,rot_eig_min,"
+      << "rot_eig_mid,rot_eig_max,rot_condition_ratio,trans_trace,"
+      << "trans_eig_min,trans_eig_mid,trans_eig_max,trans_condition_ratio,"
+      << "pose_trace,pose_eig_min,pose_eig_max,pose_condition_ratio,"
+      << "marg_rot_trace,marg_rot_eig_min,marg_rot_eig_mid,marg_rot_eig_max,"
+      << "marg_rot_condition_ratio,marg_trans_trace,marg_trans_eig_min,"
+      << "marg_trans_eig_mid,marg_trans_eig_max,marg_trans_condition_ratio,"
+      << "marg_pose_trace,marg_pose_eig_min,marg_pose_eig_max,"
+      << "marg_pose_condition_ratio\n";
+  visual_quality_frames_stream << std::setprecision(17);
+  visual_quality_points_stream << std::setprecision(17);
+  std::cout << "[VIO quality] logging frames and active patches to '"
+            << visual_quality_output_prefix << "_{frames,points}.csv'" << std::endl;
+  return true;
+}
+
+void VIOManager::logVisualQualityFrame(const cv::Mat &img,
+                                       double img_time_s,
+                                       double img_rel_s)
+{
+  if (!ensureVisualQualityLogOpen()) return;
+  if (inverse_composition_en)
+  {
+    static bool warned = false;
+    if (!warned)
+    {
+      std::cerr << "[VIO quality] disabled: diagnostics currently mirror the "
+                << "forward updateState path and require "
+                << "vio/inverse_composition_en=false" << std::endl;
+      warned = true;
+    }
+    visual_quality_log_enabled = false;
+    return;
+  }
+
+  const std::uint64_t frame_index = visual_quality_frame_index++;
+  const int active_count = static_cast<int>(visual_submap->voxel_points.size());
+  const double measurement_variance = std::max(1e-12, img_point_cov);
+  // Snapshot taken immediately before the VIO update in processFrame().  Keep
+  // this distinct from state->cov here, which is already the VIO posterior.
+  const Matrix7d prior_state_cov = visual_quality_prior_state_cov;
+  Matrix7d frame_normal = Matrix7d::Zero();
+  double propagated_sse_sum = 0.0;
+  double final_sse_sum = 0.0;
+  int valid_final_count = 0;
+  int improved_count = 0;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+
+  for (int i = 0; i < active_count; ++i)
+  {
+    VisualPoint *pt = visual_submap->voxel_points[i];
+    const double retrieve_propagated_sse =
+        i < static_cast<int>(visual_submap->propa_errors.size())
+            ? static_cast<double>(visual_submap->propa_errors[i]) : nan;
+    const int search_level =
+        i < static_cast<int>(visual_submap->search_levels.size())
+            ? visual_submap->search_levels[i] : -1;
+    const char *stage = state_update_enabled ? "accepted_active" : "active_tracking_only";
+
+    if (pt == nullptr)
+    {
+      visual_quality_points_stream
+          << frame_index << ',' << img_time_s << ',' << img_rel_s << ',' << i
+          << ",null_visual_point";
+      for (int column = 5; column < 50; ++column)
+        visual_quality_points_stream << ',' << nan;
+      visual_quality_points_stream << '\n';
+      continue;
+    }
+
+    const V3D point_camera = new_frame_->w2f(pt->pos_);
+    const bool valid_search_level = search_level >= 0 && search_level < 30;
+    const int scale = valid_search_level ? (1 << search_level) : 1;
+    const V2D pixel = hasFinitePositiveDepth(point_camera)
+                          ? cam->world2cam(point_camera)
+                          : V2D::Constant(nan);
+    const int diagnostic_border = (patch_size_half + 1) * scale;
+    const bool valid_projection = valid_search_level &&
+        hasFinitePositiveDepth(point_camera) &&
+        patchSamplingInBounds(pixel, scale, patch_size, patch_size_half, img,
+                              width, height, true);
+    if (!valid_projection ||
+        i >= static_cast<int>(visual_submap->warp_patch.size()) ||
+        i >= static_cast<int>(visual_submap->inv_expo_list.size()) ||
+        visual_submap->warp_patch[i].size() <
+            static_cast<size_t>(patch_size_total))
+    {
+      visual_quality_points_stream
+          << frame_index << ',' << img_time_s << ',' << img_rel_s << ',' << i
+          << ",invalid_final_projection," << pixel[0] << ',' << pixel[1]
+          << ',' << pt->pos_[0] << ',' << pt->pos_[1] << ',' << pt->pos_[2]
+          << ',' << point_camera[2] << ',' << point_camera.norm() << ',' << nan
+          << ',' << nan << ',' << nan << ',' << search_level
+          << ',' << nan << ',' << retrieve_propagated_sse;
+      for (int column = 18; column < 50; ++column)
+        visual_quality_points_stream << ',' << nan;
+      visual_quality_points_stream << '\n';
+      continue;
+    }
+
+    MD(2, 3) projection_jacobian;
+    computeProjectionJacobian(point_camera, projection_jacobian);
+    M3D point_hat;
+    point_hat << SKEW_SYM_MATRX(point_camera);
+    const M3D Rwi(state->rot_end);
+    const M3D Jdp_dt_local = Rci * Rwi.transpose();
+    const double u = pixel[0];
+    const double v = pixel[1];
+    const int u_i = floorf(pixel[0] / scale) * scale;
+    const int v_i = floorf(pixel[1] / scale) * scale;
+    const float subpixel_u = static_cast<float>((u - u_i) / scale);
+    const float subpixel_v = static_cast<float>((v - v_i) / scale);
+    const float weight_tl = (1.0f - subpixel_u) * (1.0f - subpixel_v);
+    const float weight_tr = subpixel_u * (1.0f - subpixel_v);
+    const float weight_bl = (1.0f - subpixel_u) * subpixel_v;
+    const float weight_br = subpixel_u * subpixel_v;
+    const std::vector<float> &reference_patch = visual_submap->warp_patch[i];
+    const double inverse_reference_exposure = visual_submap->inv_expo_list[i];
+    // Recompute the propagated error on the same search-level sampling grid as
+    // the final finest-level update.  The upstream propa_errors value is kept
+    // separately because it samples the current image at unit scale, making
+    // its green/blue comparison inconsistent when search_level > 0.
+    const auto compute_sse_at_state = [&](const StatesGroup &sample_state) {
+      const M3D sample_Rcw = Rci * sample_state.rot_end.transpose();
+      const V3D sample_Pcw = -Rci * sample_state.rot_end.transpose() *
+                             sample_state.pos_end + Pci;
+      const V3D sample_point_camera = sample_Rcw * pt->pos_ + sample_Pcw;
+      if (!hasFinitePositiveDepth(sample_point_camera)) return nan;
+      const V2D sample_pixel = cam->world2cam(sample_point_camera);
+      if (!patchSamplingInBounds(sample_pixel, scale, patch_size,
+                                 patch_size_half, img, width, height, false))
+        return nan;
+      const int sample_u_i = floorf(sample_pixel[0] / scale) * scale;
+      const int sample_v_i = floorf(sample_pixel[1] / scale) * scale;
+      const float sample_subpixel_u =
+          static_cast<float>((sample_pixel[0] - sample_u_i) / scale);
+      const float sample_subpixel_v =
+          static_cast<float>((sample_pixel[1] - sample_v_i) / scale);
+      const float sample_weight_tl =
+          (1.0f - sample_subpixel_u) * (1.0f - sample_subpixel_v);
+      const float sample_weight_tr = sample_subpixel_u * (1.0f - sample_subpixel_v);
+      const float sample_weight_bl = (1.0f - sample_subpixel_u) * sample_subpixel_v;
+      const float sample_weight_br = sample_subpixel_u * sample_subpixel_v;
+      double sse = 0.0;
+      for (int x = 0; x < patch_size; ++x)
+      {
+        uint8_t *sample_pointer = (uint8_t *)img.data +
+            (sample_v_i + x * scale - patch_size_half * scale) * width +
+            sample_u_i - patch_size_half * scale;
+        for (int y = 0; y < patch_size; ++y, sample_pointer += scale)
+        {
+          const int patch_index = x * patch_size + y;
+          const double current_value =
+              sample_weight_tl * sample_pointer[0] +
+              sample_weight_tr * sample_pointer[scale] +
+              sample_weight_bl * sample_pointer[scale * width] +
+              sample_weight_br * sample_pointer[scale * width + scale];
+          const double residual = sample_state.inv_expo_time * current_value -
+              inverse_reference_exposure * reference_patch[patch_index];
+          sse += residual * residual;
+        }
+      }
+      return sse;
+    };
+    const double propagated_sse =
+        compute_sse_at_state(visual_quality_prior_state);
+    std::vector<float> current_patch(patch_size_total, 0.0f);
+    Eigen::Matrix<double, Eigen::Dynamic, 7> patch_jacobian(patch_size_total, 7);
+    patch_jacobian.setZero();
+    double final_sse = 0.0;
+
+    for (int x = 0; x < patch_size; ++x)
+    {
+      uint8_t *image_pointer = (uint8_t *)img.data +
+          (v_i + x * scale - patch_size_half * scale) * width +
+          u_i - patch_size_half * scale;
+      for (int y = 0; y < patch_size; ++y, image_pointer += scale)
+      {
+        const float du = 0.5f *
+            ((weight_tl * image_pointer[scale] + weight_tr * image_pointer[2 * scale] +
+              weight_bl * image_pointer[scale * width + scale] +
+              weight_br * image_pointer[scale * width + 2 * scale]) -
+             (weight_tl * image_pointer[-scale] + weight_tr * image_pointer[0] +
+              weight_bl * image_pointer[scale * width - scale] +
+              weight_br * image_pointer[scale * width]));
+        const float dv = 0.5f *
+            ((weight_tl * image_pointer[scale * width] +
+              weight_tr * image_pointer[scale * width + scale] +
+              weight_bl * image_pointer[2 * scale * width] +
+              weight_br * image_pointer[2 * scale * width + scale]) -
+             (weight_tl * image_pointer[-scale * width] +
+              weight_tr * image_pointer[-scale * width + scale] +
+              weight_bl * image_pointer[0] + weight_br * image_pointer[scale]));
+        MD(1, 2) image_jacobian;
+        image_jacobian << du, dv;
+        image_jacobian *= state->inv_expo_time;
+        image_jacobian *= 1.0 / scale;
+        const MD(1, 3) Jdphi = image_jacobian * projection_jacobian * point_hat;
+        const MD(1, 3) Jdp = -image_jacobian * projection_jacobian;
+        const MD(1, 3) JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+        const MD(1, 3) Jdt = Jdp * Jdp_dt_local;
+        const int patch_index = x * patch_size + y;
+        const double current_value =
+            weight_tl * image_pointer[0] + weight_tr * image_pointer[scale] +
+            weight_bl * image_pointer[scale * width] +
+            weight_br * image_pointer[scale * width + scale];
+        if (exposure_estimate_en)
+          patch_jacobian.block<1, 7>(patch_index, 0) << JdR, Jdt, current_value;
+        else
+        {
+          patch_jacobian.block<1, 6>(patch_index, 0) << JdR, Jdt;
+          patch_jacobian(patch_index, 6) = 0.0;
+        }
+        current_patch[patch_index] = static_cast<float>(current_value);
+        const double residual = state->inv_expo_time * current_value -
+            inverse_reference_exposure * reference_patch[patch_index];
+        final_sse += residual * residual;
+      }
+    }
+
+    const Matrix7d patch_normal =
+        (patch_jacobian.transpose() * patch_jacobian) / measurement_variance;
+    const Matrix6d raw_patch_pose_info = patch_normal.block<6, 6>(0, 0);
+    const Matrix6d marginalized_patch_pose_info =
+        exposureMarginalizedPoseInfo(patch_normal, exposure_estimate_en);
+    const VisualInfoMetrics metrics = computeVisualInfoMetrics(raw_patch_pose_info);
+    const VisualInfoMetrics marginalized_metrics =
+        computeVisualInfoMetrics(marginalized_patch_pose_info);
+    frame_normal += patch_normal;
+    ++valid_final_count;
+    if (std::isfinite(propagated_sse)) propagated_sse_sum += propagated_sse;
+    final_sse_sum += final_sse;
+    const bool improved = std::isfinite(propagated_sse) && final_sse <= propagated_sse;
+    if (improved) ++improved_count;
+    const double propagated_rmse = std::isfinite(propagated_sse)
+        ? std::sqrt(propagated_sse / std::max(1, patch_size_total)) : nan;
+    const double final_rmse = std::sqrt(final_sse / std::max(1, patch_size_total));
+    const double shi_tomasi = vk::shiTomasiScore(img, pixel[0], pixel[1]);
+    const double ncc = calculateNCC(const_cast<float *>(reference_patch.data()),
+                                    current_patch.data(), patch_size_total);
+    const V3D normal_camera = new_frame_->T_f_w_.rotation_matrix() * pt->normal_;
+    const double view_cos = normal_camera.norm() > 1e-12 && point_camera.norm() > 1e-12
+        ? std::abs(normal_camera.normalized().dot(point_camera.normalized())) : nan;
+
+    visual_quality_points_stream
+        << frame_index << ',' << img_time_s << ',' << img_rel_s << ',' << i
+        << ',' << stage << ',' << u << ',' << v
+        << ',' << pt->pos_[0] << ',' << pt->pos_[1] << ',' << pt->pos_[2]
+        << ',' << point_camera[2] << ',' << point_camera.norm() << ',' << view_cos
+        << ',' << shi_tomasi << ',' << ncc << ',' << search_level
+        << ',' << propagated_sse << ',' << retrieve_propagated_sse
+        << ',' << propagated_rmse
+        << ',' << final_sse << ',' << final_rmse << ',' << (improved ? 1 : 0)
+        << ',' << metrics.rot_trace << ',' << metrics.rot_eig_min
+        << ',' << metrics.rot_eig_mid << ',' << metrics.rot_eig_max
+        << ',' << metrics.rot_condition_ratio << ',' << metrics.trans_trace
+        << ',' << metrics.trans_eig_min << ',' << metrics.trans_eig_mid
+        << ',' << metrics.trans_eig_max << ',' << metrics.trans_condition_ratio
+        << ',' << metrics.pose_trace << ',' << metrics.pose_eig_min
+        << ',' << metrics.pose_eig_max << ',' << metrics.pose_condition_ratio
+        << ',' << marginalized_metrics.rot_trace
+        << ',' << marginalized_metrics.rot_eig_min
+        << ',' << marginalized_metrics.rot_eig_mid
+        << ',' << marginalized_metrics.rot_eig_max
+        << ',' << marginalized_metrics.rot_condition_ratio
+        << ',' << marginalized_metrics.trans_trace
+        << ',' << marginalized_metrics.trans_eig_min
+        << ',' << marginalized_metrics.trans_eig_mid
+        << ',' << marginalized_metrics.trans_eig_max
+        << ',' << marginalized_metrics.trans_condition_ratio
+        << ',' << marginalized_metrics.pose_trace
+        << ',' << marginalized_metrics.pose_eig_min
+        << ',' << marginalized_metrics.pose_eig_max
+        << ',' << marginalized_metrics.pose_condition_ratio << '\n';
+  }
+
+  const Matrix6d frame_pose_info = frame_normal.block<6, 6>(0, 0);
+  const Matrix6d marginalized_frame_pose_info =
+      exposureMarginalizedPoseInfo(frame_normal, exposure_estimate_en);
+  const VisualInfoMetrics frame_metrics = computeVisualInfoMetrics(frame_pose_info);
+  const VisualInfoMetrics marginalized_frame_metrics =
+      computeVisualInfoMetrics(marginalized_frame_pose_info);
+  const double pose_information_gain_nats =
+      poseInformationGainNats(prior_state_cov, frame_normal);
+  const double improved_ratio = valid_final_count > 0
+      ? static_cast<double>(improved_count) / valid_final_count : 0.0;
+  const double error_ratio = propagated_sse_sum > 1e-12
+      ? final_sse_sum / propagated_sse_sum : 1.0;
+  visual_quality_frames_stream
+      << frame_index << ',' << img_time_s << ',' << img_rel_s
+      << ',' << img.cols << ',' << img.rows << ',' << (state_update_enabled ? 1 : 0)
+      << ',' << active_count << ',' << valid_final_count << ',' << improved_count
+      << ',' << improved_ratio << ',' << propagated_sse_sum << ',' << final_sse_sum
+      << ',' << error_ratio << ',' << frame_metrics.rot_trace
+      << ',' << frame_metrics.rot_eig_min << ',' << frame_metrics.rot_eig_mid
+      << ',' << frame_metrics.rot_eig_max << ',' << frame_metrics.rot_condition_ratio
+      << ',' << frame_metrics.trans_trace << ',' << frame_metrics.trans_eig_min
+      << ',' << frame_metrics.trans_eig_mid << ',' << frame_metrics.trans_eig_max
+      << ',' << frame_metrics.trans_condition_ratio << ',' << frame_metrics.pose_trace
+      << ',' << frame_metrics.pose_eig_min << ',' << frame_metrics.pose_eig_max
+      << ',' << frame_metrics.pose_condition_ratio
+      << ',' << marginalized_frame_metrics.rot_trace
+      << ',' << marginalized_frame_metrics.rot_eig_min
+      << ',' << marginalized_frame_metrics.rot_eig_mid
+      << ',' << marginalized_frame_metrics.rot_eig_max
+      << ',' << marginalized_frame_metrics.rot_condition_ratio
+      << ',' << marginalized_frame_metrics.trans_trace
+      << ',' << marginalized_frame_metrics.trans_eig_min
+      << ',' << marginalized_frame_metrics.trans_eig_mid
+      << ',' << marginalized_frame_metrics.trans_eig_max
+      << ',' << marginalized_frame_metrics.trans_condition_ratio
+      << ',' << marginalized_frame_metrics.pose_trace
+      << ',' << marginalized_frame_metrics.pose_eig_min
+      << ',' << marginalized_frame_metrics.pose_eig_max
+      << ',' << marginalized_frame_metrics.pose_condition_ratio
+      << ',' << pose_information_gain_nats << '\n';
+
+  if (visual_quality_flush_every_n_frames <= 1 ||
+      visual_quality_frame_index % visual_quality_flush_every_n_frames == 0)
+  {
+    visual_quality_frames_stream.flush();
+    visual_quality_points_stream.flush();
+  }
 }
 
 void VIOManager::setImuToLidarExtrinsic(const V3D &transl, const M3D &rot)
@@ -53,6 +640,9 @@ void VIOManager::initializeVIO()
   width = cam->width();
   height = cam->height();
 
+  if (width <= 0 || height <= 0)
+    throw std::runtime_error("VIO camera dimensions must be positive");
+
   printf("width: %d, height: %d, scale: %f\n", width, height, image_resize_factor);
   Rci = Rcl * Rli;
   Pci = Rcl * Pli + Pcl;
@@ -66,14 +656,15 @@ void VIOManager::initializeVIO()
 
   if (grid_size > 10)
   {
-    grid_n_width = ceil(static_cast<double>(width / grid_size));
-    grid_n_height = ceil(static_cast<double>(height / grid_size));
+    grid_n_width = (width + grid_size - 1) / grid_size;
+    grid_n_height = (height + grid_size - 1) / grid_size;
   }
   else
   {
-    grid_size = static_cast<int>(height / grid_n_height);
-    grid_n_height = ceil(static_cast<double>(height / grid_size));
-    grid_n_width = ceil(static_cast<double>(width / grid_size));
+    const int requested_grid_rows = std::max(1, grid_n_height);
+    grid_size = std::max(1, height / requested_grid_rows);
+    grid_n_height = (height + grid_size - 1) / grid_size;
+    grid_n_width = (width + grid_size - 1) / grid_size;
   }
   length = grid_n_width * grid_n_height;
 
@@ -100,8 +691,8 @@ void VIOManager::initializeVIO()
 
         if (grid_row == 1 || grid_col == 1 || grid_row == grid_n_height || grid_col == grid_n_width) border_flag[index] = 1;
 
-        int u = grid_size / 2 + (grid_col - 1) * grid_size;
-        int v = grid_size / 2 + (grid_row - 1) * grid_size;
+        int u = std::min(width - 1, grid_size / 2 + (grid_col - 1) * grid_size);
+        int v = std::min(height - 1, grid_size / 2 + (grid_row - 1) * grid_size);
         // it[ u + v * width ] = 255;
         for (float d_temp = d_min; d_temp <= d_max; d_temp += step)
         {
@@ -421,7 +1012,12 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         float depth = pt_c[2];
         int col = int(px[0]);
         int row = int(px[1]);
-        it[width * row + col] = depth;
+        // This image is used as an occlusion z-buffer below.  Overwriting it
+        // made the result depend on the order emitted by PCL's voxel filter.
+        // Keep the nearest positive depth so identical point sets produce the
+        // same visibility decision regardless of input ordering.
+        float &pixel_depth = it[width * row + col];
+        if (pixel_depth == 0.0f || depth < pixel_depth) pixel_depth = depth;
       }
     }
     // t_depth += omp_get_wtime()-t2;
@@ -437,10 +1033,17 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
   // double t1 = omp_get_wtime();
   vector<VOXEL_LOCATION> DeleteKeyList;
 
-  for (auto &iter : sub_feat_map)
-  {
-    VOXEL_LOCATION position = iter.first;
+  // unordered_map iteration order is an implementation detail.  Selection is
+  // mostly a per-grid minimum, but a deterministic traversal also makes exact
+  // ties replayable and keeps future selection changes from inheriting hash
+  // bucket order.
+  vector<VOXEL_LOCATION> sub_feat_keys;
+  sub_feat_keys.reserve(sub_feat_map.size());
+  for (const auto &entry : sub_feat_map) sub_feat_keys.push_back(entry.first);
+  std::sort(sub_feat_keys.begin(), sub_feat_keys.end(), voxelLocationLess);
 
+  for (const VOXEL_LOCATION &position : sub_feat_keys)
+  {
     // double t4 = omp_get_wtime();
     auto corre_voxel = feat_map.find(position);
     // double t5 = omp_get_wtime();
@@ -468,11 +1071,14 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         {
           // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(0, 255, 255), -1, 8);
           voxel_in_fov = true;
-          int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
+          const int index = checkedGridIndex(pc, grid_size, grid_n_width,
+                                             grid_n_height);
+          if (index < 0) continue;
           grid_num[index] = TYPE_MAP;
           Vector3d obs_vec(new_frame_->pos() - pt->pos_);
           float cur_dist = obs_vec.norm();
-          if (cur_dist <= map_dist[index])
+          if (preferMapPoint(cur_dist, pt, map_dist[index],
+                             retrieve_voxel_points[index]))
           {
             map_dist[index] = cur_dist;
             retrieve_voxel_points[index] = pt;
@@ -549,13 +1155,16 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
               // sub_map_ray_fov.push_back(pt);
 
               voxel_in_fov = true;
-              int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
+              const int index = checkedGridIndex(pc, grid_size, grid_n_width,
+                                                 grid_n_height);
+              if (index < 0) continue;
               grid_num[index] = TYPE_MAP;
               Vector3d obs_vec(new_frame_->pos() - pt->pos_);
 
               float cur_dist = obs_vec.norm();
 
-              if (cur_dist <= map_dist[index])
+              if (preferMapPoint(cur_dist, pt, map_dist[index],
+                                 retrieve_voxel_points[index]))
               {
                 map_dist[index] = cur_dist;
                 retrieve_voxel_points[index] = pt;
@@ -784,6 +1393,10 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
 {
   if (total_points == 0) return;
+
+  // Do not let a frame with no valid photometric measurements reuse the gain
+  // from a previous frame when the caller applies the covariance update.
+  G.setZero();
   
   compute_jacobian_time = update_ekf_time = 0.0;
 
@@ -815,13 +1428,16 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 
     if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
     {
-      int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
+      const int index = checkedGridIndex(pc, grid_size, grid_n_width,
+                                         grid_n_height);
+      if (index < 0) continue;
 
       if (grid_num[index] != TYPE_MAP)
       {
         float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
         // if (cur_value < 5) continue;
-        if (cur_value > scan_value[index])
+        if (preferPointCandidate(cur_value, pg[i], grid_num[index],
+                                 scan_value[index], append_voxel_points[index]))
         {
           scan_value[index] = cur_value;
           append_voxel_points[index] = pg[i];
@@ -838,12 +1454,17 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 
     if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
     {
-      int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
+      const int index = checkedGridIndex(pc, grid_size, grid_n_width,
+                                         grid_n_height);
+      if (index < 0) continue;
 
       if (grid_num[index] != TYPE_MAP)
       {
         float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
-        if (cur_value > scan_value[index])
+        if (preferPointCandidate(cur_value,
+                                 visual_submap->add_from_voxel_map[j],
+                                 grid_num[index], scan_value[index],
+                                 append_voxel_points[index]))
         {
           scan_value[index] = cur_value;
           append_voxel_points[index] = visual_submap->add_from_voxel_map[j];
@@ -922,10 +1543,11 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     }
 
     V2D pc(new_frame_->w2c(pt->pos_));
+    if (!patchSamplingInBounds(pc, 1, patch_size, patch_size_half, img,
+                               width, height, false))
+      continue;
     bool add_flag = false;
     
-    float *patch_temp = new float[patch_size_total];
-    getImagePatch(img, pc, patch_temp, 0);
     // TODO: condition: distance and view_angle
     // Step 1: time
     Feature *last_feature = pt->obs_.back();
@@ -955,6 +1577,8 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     {
       update_num += 1;
       update_flag[i] = 1;
+      float *patch_temp = new float[patch_size_total];
+      getImagePatch(img, pc, patch_temp, 0);
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
       ftr_new->img_ = img;
@@ -1338,19 +1962,29 @@ void VIOManager::precomputeReferencePatches(int level)
   H_sub_inv.setZero();
   M3D p_w_hat;
 
+  if (level < 0 || level >= 30)
+  {
+    has_ref_patch_cache = true;
+    return;
+  }
+  const int scale = (1 << level);
+
   for (int i = 0; i < total_points; i++)
   {
-    const int scale = (1 << level);
-
     VisualPoint *pt = visual_submap->voxel_points[i];
-    cv::Mat img = pt->ref_patch->img_;
+    if (pt == nullptr || pt->ref_patch == nullptr || !pt->pos_.allFinite())
+      continue;
+    Feature *ref_patch = pt->ref_patch;
+    cv::Mat img = ref_patch->img_;
 
-    if (pt == nullptr) continue;
-
-    double depth((pt->pos_ - pt->ref_patch->pos()).norm());
-    V3D pf = pt->ref_patch->f_ * depth;
-    V2D pc = pt->ref_patch->px_;
-    M3D R_ref_w = pt->ref_patch->T_f_w_.rotation_matrix();
+    const double depth = (pt->pos_ - ref_patch->pos()).norm();
+    V3D pf = ref_patch->f_ * depth;
+    V2D pc = ref_patch->px_;
+    if (!std::isfinite(depth) || !hasFinitePositiveDepth(pf) ||
+        !patchSamplingInBounds(pc, scale, patch_size, patch_size_half, img,
+                               width, height, true))
+      continue;
+    M3D R_ref_w = ref_patch->T_f_w_.rotation_matrix();
 
     computeProjectionJacobian(pf, Jdpi);
     p_w_hat << SKEW_SYM_MATRX(pt->pos_);
@@ -1397,7 +2031,7 @@ void VIOManager::precomputeReferencePatches(int level)
 
 void VIOManager::updateStateInverse(cv::Mat img, int level)
 {
-  if (total_points == 0) return;
+  if (total_points == 0 || level < 0 || level >= 30) return;
   StatesGroup old_state = (*state);
   V2D pc;
   MD(1, 2) Jimg;
@@ -1431,6 +2065,9 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
     Rcw = Rci * Rwi.transpose();
     Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
 
+    z.setZero();
+    H_sub.setZero();
+
     M3D p_hat;
 
     for (int i = 0; i < total_points; i++)
@@ -1439,12 +2076,30 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
       const int scale = (1 << level);
 
+      if (i >= static_cast<int>(visual_submap->warp_patch.size()) ||
+          i >= static_cast<int>(visual_submap->errors.size()))
+        continue;
+
       VisualPoint *pt = visual_submap->voxel_points[i];
 
-      if (pt == nullptr) continue;
+      if (pt == nullptr || pt->ref_patch == nullptr || !pt->pos_.allFinite())
+        continue;
+
+      Feature *ref_patch = pt->ref_patch;
+      const double ref_depth = (pt->pos_ - ref_patch->pos()).norm();
+      const V3D ref_pf = ref_patch->f_ * ref_depth;
+      if (!std::isfinite(ref_depth) || !hasFinitePositiveDepth(ref_pf) ||
+          !patchSamplingInBounds(ref_patch->px_, scale, patch_size,
+                                 patch_size_half, ref_patch->img_, width,
+                                 height, true))
+        continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!hasFinitePositiveDepth(pf)) continue;
       pc = cam->world2cam(pf);
+      if (!patchSamplingInBounds(pc, scale, patch_size, patch_size_half, img,
+                                 width, height, false))
+        continue;
 
       const float u_ref = pc[0];
       const float v_ref = pc[1];
@@ -1458,6 +2113,8 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       const float w_ref_br = subpix_u_ref * subpix_v_ref;
 
       vector<float> P = visual_submap->warp_patch[i];
+      if (P.size() < static_cast<size_t>(patch_size_total * (level + 1)))
+        continue;
       for (int x = 0; x < patch_size; x++)
       {
         uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
@@ -1479,6 +2136,11 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       error += patch_error;
     }
 
+    if (n_meas == 0)
+    {
+      (*state) = old_state;
+      break;
+    }
     error = error / n_meas;
 
     compute_jacobian_time += omp_get_wtime() - t1;
@@ -1519,7 +2181,7 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
 void VIOManager::updateState(cv::Mat img, int level)
 {
-  if (total_points == 0) return;
+  if (total_points == 0 || level < 0 || level >= 30) return;
   StatesGroup old_state = (*state);
 
   VectorXd z;
@@ -1532,6 +2194,7 @@ void VIOManager::updateState(cv::Mat img, int level)
   z.setZero();
   H_sub.resize(H_DIM, 7);
   H_sub.setZero();
+  std::vector<uint8_t> valid_measurement(total_points, 0);
 
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
@@ -1542,6 +2205,9 @@ void VIOManager::updateState(cv::Mat img, int level)
     Rcw = Rci * Rwi.transpose();
     Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
     Jdp_dt = Rci * Rwi.transpose();
+    z.setZero();
+    H_sub.setZero();
+    std::fill(valid_measurement.begin(), valid_measurement.end(), 0);
     
     // int max_threads = omp_get_max_threads();
     // int desired_threads = std::min(max_threads, total_points);
@@ -1559,17 +2225,27 @@ void VIOManager::updateState(cv::Mat img, int level)
       MD(1, 3) Jdphi, Jdp, JdR, Jdt;
 
       float patch_error = 0.0;
+      if (i >= static_cast<int>(visual_submap->search_levels.size()) ||
+          i >= static_cast<int>(visual_submap->warp_patch.size()) ||
+          i >= static_cast<int>(visual_submap->inv_expo_list.size()) ||
+          i >= static_cast<int>(visual_submap->errors.size()))
+        continue;
       int search_level = visual_submap->search_levels[i];
       int pyramid_level = level + search_level;
+      if (pyramid_level < 0 || pyramid_level >= 30) continue;
       int scale = (1 << pyramid_level);
       float inv_scale = 1.0f / scale;
 
       VisualPoint *pt = visual_submap->voxel_points[i];
 
-      if (pt == nullptr) continue;
+      if (pt == nullptr || !pt->pos_.allFinite()) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!hasFinitePositiveDepth(pf)) continue;
       V2D pc = cam->world2cam(pf);
+      if (!patchSamplingInBounds(pc, scale, patch_size, patch_size_half, img,
+                                 width, height, true))
+        continue;
 
       computeProjectionJacobian(pf, Jdpi);
       M3D p_hat;
@@ -1587,6 +2263,9 @@ void VIOManager::updateState(cv::Mat img, int level)
       float w_ref_br = subpix_u_ref * subpix_v_ref;
 
       vector<float> P = visual_submap->warp_patch[i];
+      if (level < 0 ||
+          P.size() < static_cast<size_t>(patch_size_total * (level + 1)))
+        continue;
       double inv_ref_expo = visual_submap->inv_expo_list[i];
       // ROS_ERROR("inv_ref_expo: %.3lf, state->inv_expo_time: %.3lf\n", inv_ref_expo, state->inv_expo_time);
 
@@ -1626,6 +2305,7 @@ void VIOManager::updateState(cv::Mat img, int level)
         }
       }
       visual_submap->errors[i] = patch_error;
+      valid_measurement[i] = 1;
     }
 
     // Keep the expensive Jacobian/residual evaluation parallel, but make the
@@ -1638,9 +2318,14 @@ void VIOManager::updateState(cv::Mat img, int level)
     int n_meas = 0;
     for (int i = 0; i < total_points; ++i)
     {
-      if (visual_submap->voxel_points[i] == nullptr) continue;
+      if (!valid_measurement[i]) continue;
       error_sum += static_cast<double>(visual_submap->errors[i]);
       n_meas += patch_size_total;
+    }
+    if (n_meas == 0)
+    {
+      (*state) = old_state;
+      break;
     }
     const float error = n_meas > 0
                             ? static_cast<float>(error_sum / static_cast<double>(n_meas))
@@ -1819,7 +2504,10 @@ void VIOManager::dumpDataForColmap()
   cnt++;
 }
 
-void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
+void VIOManager::processFrame(
+    cv::Mat &img, vector<pointWithVar> &pg,
+    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
+    double img_time_s, double img_rel_s)
 {
   last_translation_info_ratio = 0.0;
   last_rotation_info_ratio = 0.0;
@@ -1845,6 +2533,15 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   retrieveFromVisualSparseMap(img, pg, feat_map);
 
   double t2 = omp_get_wtime();
+
+  // The prior for this visual update is the post-propagation/post-LIO state at
+  // VIO entry.  Snapshot it before covariance is updated so the diagnostic
+  // logdet has the advertised prior-whitened meaning.
+  if (visual_quality_log_enabled)
+  {
+    visual_quality_prior_state = *state;
+    visual_quality_prior_state_cov = state->cov.block<7, 7>(0, 0);
+  }
 
   if (state_update_enabled)
   {
@@ -1881,6 +2578,14 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   last_inlier_ratio = quality_count ? static_cast<double>(improved) / quality_count : 0.0;
   last_error_ratio = propagated_error_sum > 1e-9
       ? final_error_sum / propagated_error_sum : 1.0;
+
+  // Re-evaluate the final optimizer level (level=0 plus each patch's stored
+  // search level) residuals/Jacobians at the finalized accepted/rolled-back
+  // state.  This mirrors updateState(img, 0) without applying another update.
+  // This intentionally runs after the optimizer and is strictly read-only, so
+  // a rejected final iteration can never leak its residual/Jacobian into the
+  // CSV or affect estimator behavior.
+  logVisualQualityFrame(img, img_time_s, img_rel_s);
 
   double t3 = omp_get_wtime();
 

@@ -14,14 +14,20 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
+#include "imu_init_buffer.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
 #include <nav_msgs/Path.h>
 #include <vikit/camera_loader.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Transform.h>
 #include <std_msgs/Empty.h>
+#include <cstdint>
+#include <limits>
+#include <memory>
 
 class LIVMapper
 {
@@ -39,9 +45,18 @@ public:
   void handleLIO();
   void savePCD();
   void processImu();
+  void maybeLatchLiveImuInitAnchor(double synchronized_epoch,
+                                   double lidar_watermark,
+                                   double image_epoch);
+  void failImuInitialization(const std::string &reason,
+                             std::uint64_t synchronized_epoch_ns = 0);
+  void logAcceptedImuInitialization(std::uint64_t state_epoch_ns);
   
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
+  void enqueue_imu_correction(const StatesGroup &state, double stamp);
+  void publish_imu_propagated(const sensor_msgs::Imu &imu);
+  void publish_correction_pose_cov(const StatesGroup &state, double stamp);
   void imu_prop_callback(const ros::TimerEvent &e);
   void transformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud, PointCloudXYZI::Ptr &trans_cloud);
   void pointBodyToWorld(const PointType &pi, PointType &po);
@@ -93,6 +108,8 @@ public:
   M3D R_cam2body = M3D::Identity();
   V3D t_cam2body = V3D::Zero();
   double gt_avg_sec = 3.0;
+  bool mocap_anchor_enable = true;
+  bool runtime_reinit_enable = false;
   bool body_anchor_latched = false;
   Eigen::Isometry3d T_anchor = Eigen::Isometry3d::Identity();   // optitrack <- W_L, latched once
   std::vector<std::pair<double, Eigen::Isometry3d>> gt_buf;     // recent GT (optitrack<-body) for the anchor avg
@@ -102,6 +119,10 @@ public:
   double res_mean_last = 0.05;
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;
   double b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
+  double imu_init_max_gyr_mean = 0.30;
+  double imu_init_max_gyr_std = 0.25;
+  double imu_init_max_acc_std = 1.50;
+  double imu_init_acc_norm_tolerance = 3.00;
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
@@ -113,24 +134,52 @@ public:
   int pcd_save_interval = -1, pcd_index = 0;
   int pub_scan_num = 1;
 
-  StatesGroup imu_propagate, latest_ekf_state;
+  struct ImuCorrectionSnapshot
+  {
+    double stamp;
+    StatesGroup state;
+  };
+  StatesGroup imu_propagate;
 
-  bool new_imu = false, state_update_flg = false, imu_prop_enable = true, ekf_finish_once = false;
+  bool imu_prop_enable = true, ekf_finish_once = false;
+  bool imu_propagation_valid = false;
   deque<sensor_msgs::Imu> prop_imu_buffer;
-  sensor_msgs::Imu newest_imu;
-  double latest_ekf_time;
+  deque<sensor_msgs::Imu> prop_imu_history;
+  deque<ImuCorrectionSnapshot> prop_correction_buffer;
+  double last_propagated_imu_stamp = std::numeric_limits<double>::quiet_NaN();
+  double last_prop_imu_input_stamp = std::numeric_limits<double>::quiet_NaN();
+  double last_prop_correction_stamp = std::numeric_limits<double>::quiet_NaN();
+  double imu_prop_max_dt = 0.05;
+  int imu_prop_queue_max = 4096;
+  int imu_prop_correction_queue_max = 256;
+  std::uint64_t imu_prop_invalid_sample_count = 0;
+  std::uint64_t imu_prop_nonmonotonic_count = 0;
+  std::uint64_t imu_prop_gap_count = 0;
+  std::uint64_t imu_prop_queue_drop_count = 0;
+  std::uint64_t imu_prop_history_drop_count = 0;
+  std::uint64_t imu_prop_correction_drop_count = 0;
+  std::uint64_t imu_prop_superseded_count = 0;
+  std::size_t imu_prop_pending_high_water = 0;
+  std::size_t imu_prop_history_high_water = 0;
+  std::size_t imu_prop_correction_high_water = 0;
   nav_msgs::Odometry imu_prop_odom;
   ros::Publisher pubImuPropOdom;
+  ros::Publisher pubImuPropWorldTwist;
+  ros::Publisher pubCorrectionPoseCov;
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
 
   bool gravity_align_en = false, gravity_align_finished = false, imu_only_mode = false, fusion_debug = false, vio_flip_roll = false, vio_flip_pitch = false;
+  bool visual_quality_log = false;
+  std::string visual_quality_output_prefix = "/tmp/fast_livo_visual_quality";
+  int visual_quality_flush_every_n_frames = 10;
   int vio_max_lio_features_for_fusion = -1;
   FILE *dbg_fp = nullptr;   // debug-only per-frame fusion/preintegration log (debug/fusion_log)
 
   bool sync_jump_flag = false;
 
   bool lidar_pushed = false, imu_en, gravity_est_en, flg_reset = false, ba_bg_est_en = true;
+  bool imu_init_estimate_gyr_bias = false;
   bool dense_map_en = false;
   int img_en = 1, imu_int_frame = 3;
   bool normal_en = true;
@@ -149,8 +198,32 @@ public:
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+  using ImuInitSampleBuffer =
+      fast_livo::ImuInitBuffer<sensor_msgs::Imu::ConstPtr>;
+  std::unique_ptr<ImuInitSampleBuffer> imu_init_buffer;
+  std::string imu_init_anchor_stamp_ns_param;
+  int imu_init_queue_max = 4096;
+  double imu_init_anchor_max_predecessor_gap_s = 0.02;
+  bool imu_init_anchor_explicit = false;
+  bool imu_init_failed = false;
+  bool imu_init_accepted_logged = false;
+  bool imu_init_first_correction_logged = false;
+  std::string imu_init_initial_state_sha256;
+  std::string imu_init_failure_reason;
+  std::uint64_t imu_init_anchor_lidar_watermark_ns = 0;
+  std::uint64_t imu_init_anchor_image_epoch_ns = 0;
+  std::uint64_t imu_init_anchor_imu_watermark_ns = 0;
+  std::uint64_t imu_init_last_sync_epoch_ns = 0;
+  int imu_input_queue_max = 4096;
+  std::uint64_t imu_input_queue_drop_count = 0;
+  std::uint64_t imu_pre_lidar_sample_count = 0;
+  std::size_t imu_input_high_water = 0;
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
+  int img_input_queue_max = 64;
+  std::uint64_t img_input_queue_drop_count = 0;
+  std::uint64_t img_pre_lidar_frame_count = 0;
+  std::size_t img_input_high_water = 0;
   vector<pointWithVar> _pv_list;
   vector<double> extrinT;
   vector<double> extrinR;
