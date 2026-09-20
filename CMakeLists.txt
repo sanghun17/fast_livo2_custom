@@ -129,6 +129,7 @@ add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
+add_dependencies(laser_mapping ${PROJECT_NAME}_gencfg)
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
