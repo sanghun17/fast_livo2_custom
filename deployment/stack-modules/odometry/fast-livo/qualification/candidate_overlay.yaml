@@ -1,0 +1,83 @@
+# Provisional development-only low-rate FAST-LIVO candidate on 2026-08-14.
+#
+# Evidence:
+#   ground Phase-B report:
+#     tools/fastlivo/_campaign_vio_flight_20260814/
+#       ground_phase_b_interaction_v2/phase_b_report.json
+#   report identity:
+#     548f23b20822adf3d4d56a50d18611ba130469b3b1553f96a81a1ff29a24e7de
+#   report file SHA-256:
+#     1560677834dd44c909e1a2a5687106f1e908d8db88333ba29115bb8121024a70
+#   frozen FAST-LIVO base config SHA-256:
+#     259f4de57beaf29b671a5405882f53f9e25eee68403376c8a0a69e1308691595
+#   frozen Phase-B base overlay SHA-256:
+#     5950870fb817bb07509f25c3f2ef0306e7b168f51fd03190912c41508cfdbf2d
+#
+# The exact 4-config x 5-development-session x 3-fresh-process Phase-B grid
+# ranked acc10_img1000_out600 first by the frozen worst-session-first rule.  All
+# 20 configuration/session groups reproduced the low-rate pose, init state,
+# correction stream, and numeric metrics exactly across the three repeats.
+#
+# THIS IS NOT A FLIGHT CONFIGURATION.  Every primary readiness report failed,
+# the 200 Hz propagated payload was non-deterministic in all 20 groups, PX4
+# external-vision parameters have not been bound to an FCU receipt, and the
+# VIO-local safety/mux path is not qualified.  The current legacy low-rate
+# /aft_mapped_to_body topic is post-LIO/pre-VIO; an always-on canonical final
+# posterior topic does not yet exist.  High-rate output is deliberately disabled
+# here.  Use only for disarmed/shadow or new append-only bag studies.
+
+common:
+  img_en: 1
+  lidar_en: 1
+  imu_topic: /camera/imu_hybrid
+  # The frozen bag campaign used static intrinsics.  This overlay is not a
+  # standalone launch: camera_d435i.yaml must also be loaded into the
+  # /laserMapping private namespace exactly as mapping_d435i_replay.launch does.
+  # Frozen camera_d435i.yaml SHA-256:
+  # 99c13f2cb2fa7cbcfa744138814f52c73ff20ee230ec065e1bf117767f0d2492
+  # A separate live-shadow profile may enable CameraInfo only after binding
+  # camera identity, mode and calibration, and must be rebaselined if the
+  # effective intrinsics differ.
+  online_intrinsics_en: false
+
+imu:
+  imu_en: true
+  acc_cov: 10.0
+  imu_int_frame: 30
+  # Live mode latches the first full image/LiDAR/IMU sensor epoch.  The vehicle
+  # must be disarmed and stationary before the estimator process starts.  This
+  # is an external admission requirement; the estimator does not verify armed
+  # state or ground contact itself.
+  init_anchor_stamp_ns: ""
+  init_anchor_max_predecessor_gap_s: 0.02
+  init_max_gyr_mean: 0.01
+  init_max_gyr_std: 0.04
+  init_max_acc_std: 0.25
+  init_acc_norm_tolerance: 0.10
+  init_estimate_gyr_bias: false
+
+vio:
+  max_lio_features_for_fusion: -1
+  img_point_cov: 1000.0
+  outlier_threshold: 600.0
+
+extrin_calib:
+  # camera_depth_optical_frame -> camera_color_optical_frame, inherited from
+  # the frozen Phase-B base overlay.
+  Rcl: [0.999978, 0.00659742, 0.00021399,
+        -0.00659736, 0.999978, -0.000301692,
+        -0.000215976, 0.000300274, 1.0]
+  Pcl: [0.01438551, 0.0000943, 0.00042120]
+
+mocap:
+  anchor_enable: false
+
+uav:
+  # Remains off until the dedicated worker, typed status/segment interface,
+  # live clock/latency gate, and downstream atomic-consumer path are qualified.
+  imu_rate_odom: false
+  runtime_reinit_enable: false
+
+debug:
+  fusion_log: false
+  visual_quality_log: false

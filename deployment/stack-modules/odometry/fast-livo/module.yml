@@ -1,0 +1,14 @@
+name: fast-livo
+group: odometry
+description: FAST-LIVO2 visual/LiDAR-inertial odometry. Hardware and AirSim source/launch profiles are implementation choices of the same odometry capability.
+
+deps:
+  source: [install.sh]      # Sophus a621ff (libSophus.so + sophus/se3.h)
+
+# The default hardware checkout is /work/ws/fast-livo. The AirSim profile keeps
+# its genuinely divergent branch in /work/ws/fast-livo-sim; clone/build/run scripts
+# select it through FAST_LIVO_PROFILE rather than exposing a second module.
+workspace: /work/ws/fast-livo
+clone: clone.sh
+run: [run.sh]
+provides: [odometry, odom-tf]
