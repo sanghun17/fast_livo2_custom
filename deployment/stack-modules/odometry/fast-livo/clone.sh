@@ -9,12 +9,12 @@ PROFILE="${FAST_LIVO_PROFILE:-hardware}"
 case "$PROFILE" in
   hardware)
     DST="$ROOT/ws/fast-livo/src"
-    BRANCH="${FASTLIVO_BRANCH:-jetson-orin-agx}"
+    BRANCH="${FASTLIVO_REVISION:-de5651e604edb00a85221871e7f89fc04bec4c84}"
     bash "$ROOT/scripts/lib/clone_repo.sh" "$DST" "$REPO" "$BRANCH"
     ;;
   airsim)
     SRC="$ROOT/ws/fast-livo-sim/src"
-    BRANCH="${FASTLIVO_SIM_BRANCH:-ml}"
+    BRANCH="${FASTLIVO_SIM_REVISION:-a007eea679040ebf6f40e614f77eececdc10c9b6}"
     VIKIT_REPO="${VIKIT_REPO:-https://github.com/xuankuzcr/rpg_vikit.git}"
     VIKIT_COMMIT="${VIKIT_COMMIT:-6c886c8}"
     mkdir -p "$SRC"
